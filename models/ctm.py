@@ -98,6 +98,8 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
                  dropout_nlm=None,
                  neuron_select_type='random-pairing',  
                  n_random_pairing_self=0,
+                 connectivity=32,      # (k) Neighbors per hub
+                 rewiring_prob=0.2,    # (p) Probability of rewiring local connections
                  ):
         super(ContinuousThoughtMachine, self).__init__()
 
@@ -114,6 +116,8 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         self.positional_embedding_type = positional_embedding_type
         self.neuron_select_type = neuron_select_type
         self.memory_length = memory_length
+        self.connectivity = connectivity
+        self.rewiring_prob = rewiring_prob
         dropout_nlm = dropout if dropout_nlm is None else dropout_nlm
 
         # --- Assertions ---
@@ -245,8 +249,8 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             i, j = torch.triu_indices(n_synch, n_synch)
             pairwise_product = outer[:, i, j]
             
-        elif self.neuron_select_type == 'random-pairing':
             # For random-pairing, we compute the sync between specific pairs of neurons
+        elif self.neuron_select_type in ('random-pairing', 'small-world'):
             left = activated_state[:, neuron_indices_left]
             right = activated_state[:, neuron_indices_right]
             pairwise_product = left * right
@@ -441,11 +445,23 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
                 neurons.
             """
             assert synch_type in ('out', 'action'), f"Invalid synch_type: {synch_type}"
-            left, right = self.initialize_left_right_neurons(synch_type, self.d_model, n_synch, n_random_pairing_self)
+            left, right, decay_init = self.initialize_left_right_neurons(synch_type, self.d_model, n_synch, n_random_pairing_self)
             synch_representation_size = self.synch_representation_size_action if synch_type == 'action' else self.synch_representation_size_out
             self.register_buffer(f'{synch_type}_neuron_indices_left', left)
             self.register_buffer(f'{synch_type}_neuron_indices_right', right)
-            self.register_parameter(f'decay_params_{synch_type}', nn.Parameter(torch.zeros(synch_representation_size), requires_grad=True))
+            
+            # Initialize decay parameters
+            decay_param = nn.Parameter(torch.zeros(synch_representation_size), requires_grad=True)
+            if decay_init is not None:
+                # We initialize parameters such that exp(-param) equals the desired decay.
+                # Thus, param = -ln(decay). 
+                # Note: The forward pass uses exp(-param), so positive params mean decay.
+                # Local (0.1) -> -ln(0.1) ~= 2.3. Global (1.0) -> -ln(1.0) = 0.
+                # Caution: The code likely uses clamping or exp logic. Assuming standard logic:
+                with torch.no_grad():
+                    decay_param.data = decay_init
+                    
+            self.register_parameter(f'decay_params_{synch_type}', decay_param)
 
     def initialize_left_right_neurons(self, synch_type, d_model, n_synch, n_random_pairing_self=0):
         """
@@ -453,7 +469,16 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         This complexity is owing to legacy experiments, but we retain that these types of
         neuron selections are interesting to experiment with.
         """
-        if self.neuron_select_type=='first-last':
+        decay_init = None
+        device = self.start_activated_state.device
+
+        if self.neuron_select_type == 'small-world':
+            left, right, decay_init = self._generate_small_world_indices(
+                d_model, n_synch, self.connectivity, self.rewiring_prob
+            )
+            return left.to(device), right.to(device), decay_init.to(device)
+
+        elif self.neuron_select_type == 'first-last':
             if synch_type == 'out':
                 neuron_indices_left = neuron_indices_right = torch.arange(0, n_synch)
             elif synch_type == 'action':
@@ -468,8 +493,119 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             neuron_indices_left = torch.from_numpy(np.random.choice(np.arange(d_model), size=n_synch))
             neuron_indices_right = torch.concatenate((neuron_indices_left[:n_random_pairing_self], torch.from_numpy(np.random.choice(np.arange(d_model), size=n_synch-n_random_pairing_self))))
 
+        return neuron_indices_left.to(device), neuron_indices_right.to(device), decay_init
+
+    def _generate_small_world_indices(self, d_model, n_synch, k, p):
+        """
+        Generates indices for a Small-World topology that adapts to budget constraints.
+        
+        Logic:
+        1. Calculate 'cost per hub': 1 (self-pair) + k (neighbors).
+        2. Determine max hubs affordable: n_synch // cost.
+        3. Select hubs using linspace to maximize coverage of the d_model space.
+        4. Wire hubs to themselves (energy) and neighbors (mixing).
+        """
         device = self.start_activated_state.device
-        return neuron_indices_left.to(device), neuron_indices_right.to(device)
+        
+        # 1. Config
+        neighbors_per_side = k // 2
+        actual_k = neighbors_per_side * 2
+        cost_per_node = 1 + actual_k
+        
+        # 2. Hub Selection
+        num_hubs = min(d_model, n_synch // cost_per_node)
+        
+        # --- PATH A: Pure Random (Fallback for extreme budget constraint) ---
+        if num_hubs == 0:
+            left = torch.randint(0, d_model, (n_synch,), device=device)
+            right = torch.randint(0, d_model, (n_synch,), device=device)
+            decay_init = torch.zeros(n_synch, device=device)
+            return left, right, decay_init
+
+        # --- PATH B: Small-World Generation ---
+        hubs = torch.linspace(0, d_model - 1, steps=num_hubs).long().to(device)
+        
+        # Self-Pairs
+        self_left = hubs
+        self_right = hubs
+        self_decay = torch.zeros(num_hubs, device=device) # Local = 0.0
+
+        # Neighbors
+        offsets = torch.cat([
+            torch.arange(1, neighbors_per_side + 1, device=device),
+            -torch.arange(1, neighbors_per_side + 1, device=device)
+        ])
+        
+        # Broadcast to create lattice targets: (num_hubs, actual_k)
+        # Use modulo for ring topology
+        lattice_targets = (hubs.unsqueeze(1) + offsets.unsqueeze(0)) % d_model
+        
+        # Create source indices matching targets
+        sources = hubs.unsqueeze(1).expand(-1, actual_k)
+        
+        # Vectorized Rewiring
+        # Generate random mask for rewiring (p)
+        rand_mask = torch.rand(lattice_targets.shape, device=device) < p
+        
+        # Generate random targets for where mask is True
+        random_targets = torch.randint(0, d_model, lattice_targets.shape, device=device)
+        
+        # Fix self-loops in random targets (simple rejection sampling)
+        # If random target == source, pick a new random target.
+        collisions = (random_targets == sources)
+        if collisions.any():
+            random_targets[collisions] = torch.randint(0, d_model, (collisions.sum(),), device=device)
+            
+        # Combine: Choose random target if rewired, else lattice target
+        final_targets = torch.where(rand_mask, random_targets, lattice_targets)
+        
+        # Define decay types: 1.0 for rewired (Global), 0.0 for lattice (Local)
+        neighbor_decay = torch.where(rand_mask, torch.tensor(1.0, device=device), torch.tensor(0.0, device=device))
+
+        # Assembly
+        # Flatten neighbor arrays
+        sources_flat = sources.reshape(-1)
+        targets_flat = final_targets.reshape(-1)
+        neighbor_decay_flat = neighbor_decay.reshape(-1)
+        
+        # Concatenate Self-Pairs + Neighbors
+        all_left = torch.cat([self_left, sources_flat])
+        all_right = torch.cat([self_right, targets_flat])
+        all_decay_types = torch.cat([self_decay, neighbor_decay_flat])
+        
+        # Truncate if we somehow exceeded budget
+        if all_left.size(0) > n_synch:
+            all_left = all_left[:n_synch]
+            all_right = all_right[:n_synch]
+            all_decay_types = all_decay_types[:n_synch]
+            
+        # Fill Remainder if budget exists
+        # This occurs due to integer division (n_synch // cost_per_node)
+        remainder = n_synch - all_left.size(0)
+        if remainder > 0:
+            fill_left = torch.randint(0, d_model, (remainder,), device=device)
+            fill_right = torch.randint(0, d_model, (remainder,), device=device)
+            # Init remainder decay to noisy low
+            fill_decay = torch.zeros(remainder, device=device) 
+            
+            all_left = torch.cat([all_left, fill_left])
+            all_right = torch.cat([all_right, fill_right])
+            all_decay_types = torch.cat([all_decay_types, fill_decay])
+
+        # Map types to initialization values
+        # 1.0 (Rewired Type) -> 1.0 (Transient/Coincidence Detection)
+        # 0.0 (Lattice Type) -> 0.1 (Working Memory)
+        decay_init = torch.where(all_decay_types > 0.5, torch.tensor(1.0, device=device), torch.tensor(0.1, device=device))
+
+        # Add noise to allow learning diversity
+        decay_init += torch.randn_like(decay_init) * 0.01
+        
+        # CRITICAL OPTIMIZATION: Force Self-Pairs to 0.0 (Infinite Memory)
+        # Self-pairs are the first 'num_hubs' indices. We overwrite them AFTER noise 
+        # to ensure they provide a stable "Energy" signal for normalization.
+        decay_init[:num_hubs] = 0.0
+        
+        return all_left, all_right, decay_init
 
     def get_neuron_select_type(self):
         """
@@ -479,7 +615,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         print(f"Using neuron select type: {self.neuron_select_type}")
         if self.neuron_select_type == 'first-last':
             neuron_select_type_out, neuron_select_type_action = 'first', 'last'
-        elif self.neuron_select_type in ('random', 'random-pairing'):
+        elif self.neuron_select_type in ('random', 'random-pairing', 'small-world'):
             neuron_select_type_out = neuron_select_type_action = self.neuron_select_type
         else:
             raise ValueError(f"Invalid neuron selection type: {self.neuron_select_type}")
@@ -513,7 +649,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         """
         Calculate the size of the synchronisation representation based on neuron selection type.
         """
-        if self.neuron_select_type == 'random-pairing':
+        if self.neuron_select_type in ('random-pairing', 'small-world'):
             synch_representation_size = n_synch
         elif self.neuron_select_type in ('first-last', 'random'):
             synch_representation_size = (n_synch * (n_synch + 1)) // 2

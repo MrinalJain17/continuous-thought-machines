@@ -5,10 +5,9 @@ from models.constants import VALID_NEURON_SELECT_TYPES, VALID_BACKBONE_TYPES, VA
 import numpy as np
 
 def rep_size(neuron_select_type: str, n_synch: int) -> int:
-    return n_synch if neuron_select_type == "random-pairing" else n_synch * (n_synch + 1) // 2
-
-def rep_size(neuron_select_type: str, n_synch: int) -> int:
-    return n_synch if neuron_select_type == "random-pairing" else n_synch * (n_synch + 1) // 2
+    if neuron_select_type in ["random-pairing", "small-world"]:
+        return n_synch
+    return n_synch * (n_synch + 1) // 2
 
 def grab_synch_tensors(model, s_type: str):
     if s_type == "out":
@@ -99,11 +98,15 @@ def test_golden_rl(golden_test_model_rl, golden_test_inputs_rl, golden_test_expe
 # --- General CTM Tests ---
 
 @pytest.mark.parametrize("synch_type", ["out", "action"])
-@pytest.mark.parametrize("neuron_select_type", ["first-last", "random", "random-pairing"])
+@pytest.mark.parametrize("neuron_select_type", ["first-last", "random", "random-pairing", "small-world"])
 def test_set_synchronisation_parameters(ctm_factory, base_params, device, synch_type, neuron_select_type):
     np.random.seed(0)
     n_synch = 8
     num_random_pairing_self = 2
+    
+    # Specific params to prevent crashes in small-world init
+    connectivity = 4 
+    rewiring_prob = 0.2
 
     model = ctm_factory(
         base_params,
@@ -112,6 +115,8 @@ def test_set_synchronisation_parameters(ctm_factory, base_params, device, synch_
         n_synch_action=n_synch,
         neuron_select_type=neuron_select_type,
         n_random_pairing_self=num_random_pairing_self,
+        connectivity=connectivity,
+        rewiring_prob=rewiring_prob
     ).to(device)
 
     left, right, decay = grab_synch_tensors(model, synch_type)
@@ -137,6 +142,9 @@ def test_set_synchronisation_parameters(ctm_factory, base_params, device, synch_
         pass
     elif neuron_select_type == "random-pairing":
         assert torch.equal(right[:num_random_pairing_self], left[:num_random_pairing_self])
+    elif neuron_select_type == "small-world":
+        # At least some self-pairs must exist (Energy constraint)
+        assert (left == right).any(), "Small-world should generate self-pairs"
 
 # ------ Neuron Select Type Test ---
 

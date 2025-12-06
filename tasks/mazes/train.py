@@ -81,6 +81,8 @@ def parse_args():
     parser.add_argument('--memory_hidden_dims', type=int, default=32, help='Hidden dimensions of the memory if using deep memory (CTM only).') # Default changed
     parser.add_argument('--dropout_nlm', type=float, default=None, help='Dropout rate for NLMs specifically. Unset to match dropout on the rest of the model (CTM only).')
     parser.add_argument('--do_normalisation', action=argparse.BooleanOptionalAction, default=False, help='Apply normalization in NLMs (CTM only).')
+    parser.add_argument('--connectivity', type=int, default=32, help='(k) Neighbors per hub for Small-World topology.')
+    parser.add_argument('--rewiring_prob', type=float, default=0.2, help='(p) Rewiring probability for Small-World topology.')
     # LSTM specific
     parser.add_argument('--num_layers', type=int, default=2, help='Number of LSTM stacked layers (LSTM only).') # Added LSTM arg
 
@@ -184,6 +186,8 @@ if __name__=='__main__':
             dropout_nlm=args.dropout_nlm,
             neuron_select_type=args.neuron_select_type,
             n_random_pairing_self=args.n_random_pairing_self,
+            connectivity=args.connectivity,
+            rewiring_prob=args.rewiring_prob,
         ).to(device)
     elif args.model == 'lstm':
          model = LSTMBaseline(
@@ -240,10 +244,17 @@ if __name__=='__main__':
     # Optimizer and scheduler
     decay_params = []
     no_decay_params = []
+    special_lr_params = [] # Group 3: High LR, No Weight Decay (Small-World)
+    
     no_decay_names = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
-            continue # Skip parameters that don't require gradients
+            continue
+            
+        # 1. Check for Small-World Decay Params FIRST (High LR)
+        if "decay_params" in name:
+            special_lr_params.append(param)
+            continue
         if any(exclusion_str in name for exclusion_str in args.weight_decay_exclusion_list):
             no_decay_params.append(param)
             no_decay_names.append(name)
@@ -252,17 +263,24 @@ if __name__=='__main__':
     if len(no_decay_names):
         print(f'WARNING, excluding: {no_decay_names}')
 
-    # Optimizer and scheduler (Common setup)
-    if len(no_decay_names) and args.weight_decay!=0:
-        optimizer = torch.optim.AdamW([{'params': decay_params, 'weight_decay':args.weight_decay},
-                                       {'params': no_decay_params, 'weight_decay':0}],
-                                  lr=args.lr,
-                                  eps=1e-8 if not args.use_amp else 1e-6)
-    else:
-        optimizer = torch.optim.AdamW(model.parameters(),
-                                    lr=args.lr,
-                                    eps=1e-8 if not args.use_amp else 1e-6,
-                                    weight_decay=args.weight_decay)
+    # Construct Parameter Groups
+    param_groups = []
+    
+    if len(decay_params) > 0:
+        param_groups.append({'params': decay_params, 'weight_decay': args.weight_decay})
+        
+    if len(no_decay_params) > 0:
+        param_groups.append({'params': no_decay_params, 'weight_decay': 0.0})
+        
+    if len(special_lr_params) > 0:
+        # 10x Learning Rate for decay params to encourage temporal specialization
+        param_groups.append({'params': special_lr_params, 'weight_decay': 0.0, 'lr': args.lr * 10.0})
+
+    optimizer = torch.optim.AdamW(
+        param_groups,
+        lr=args.lr, # Default LR for groups that don't specify it
+        eps=1e-8 if not args.use_amp else 1e-6
+    )
 
     warmup_schedule = warmup(args.warmup_steps)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warmup_schedule.step)
@@ -667,6 +685,30 @@ if __name__=='__main__':
                                           targets_viz[longest_index].detach().cpu().numpy(), # S
                                           attention_tracking_viz[:, longest_index],  # Pass T, (H), H, W
                                           args.log_dir)
+                            # --- Small-World Health Check ---
+                            if bi % args.track_every == 0 and hasattr(model, 'out_neuron_indices_left'):
+                                with torch.no_grad():
+                                    # 1. Decay Parameter Check
+                                    decay = model.decay_params_out
+                                    is_self = (model.out_neuron_indices_left == model.out_neuron_indices_right)
+                                    log_msg = f"[Iter {bi}]"
+                                    
+                                    # 2. Hub Health (Energy Check)
+                                    # We check the 'synchronisation' output for the Self-Pairs.
+                                    if is_self.any():
+                                        # Energy = z dot z. If this is 0, the hub is dead.
+                                        hub_energy = synchronisation[:, is_self].mean().item()
+                                        
+                                        # Decay stats
+                                        self_decay = decay[is_self].mean().item()
+                                        other_decay = decay[~is_self].mean().item()
+                                        
+                                        log_msg += f" Hub Energy: {hub_energy:.5f} | Decay: Self={self_decay:.3f} / Other={other_decay:.3f}"
+                                    else:
+                                        # Fallback for baseline (random-pairing)
+                                        mean_sync = synchronisation.mean().item()
+                                        log_msg += f" Mean Synch: {mean_sync:.5f}"
+                                    tqdm.write(log_msg)
                         #  except Exception as e:
                         #       print(f"Visualization failed for model {args.model}: {e}")
                     # --- End Visualization ---

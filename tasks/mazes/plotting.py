@@ -129,7 +129,7 @@ def make_maze_gif(inputs, predictions, targets, attention_tracking, save_locatio
     cmap = plt.get_cmap('gist_rainbow')
     cmap_viridis = plt.get_cmap('viridis')
     step_linspace = np.linspace(0, 1, predictions.shape[-1])  # For sampling colours
-    with tqdm(total=predictions.shape[-1], initial=0, leave=True, position=1, dynamic_ncols=True) as pbar:
+    with tqdm(total=predictions.shape[-1], initial=0, leave=False, position=1, dynamic_ncols=True) as pbar:
         if verbose: pbar.set_description('Processing frames for maze plotting')
         for stepi in np.arange(0, predictions.shape[-1], 1):
             fig, axes = plt.subplot_mosaic(mosaic, figsize=aspect_ratio)

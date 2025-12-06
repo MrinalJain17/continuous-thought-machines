@@ -14,3 +14,70 @@ We also provide a 'mazes-small' dataset (see [here](https://drive.google.com/fil
 ```
 python -m tasks.mazes.train --dataset mazes-small --maze_route_length 50 --cirriculum_lookahead 5  --model ctm --d_model 1024 --d_input 256 --backbone_type resnet18-1 --synapse_depth 8 --heads 4 --n_synch_out 128 --n_synch_action 128 --neuron_select_type random-pairing --memory_length 25 --iterations 50 --training_iterations 100001 --lr 1e-4 --batch_size 64 --batch_size_test 32 --n_test_batches 50 --log_dir logs/mazes-small-tester --track_every 2000
 ```
+
+## Small world
+
+Baseline:
+```
+python -m tasks.mazes.train \
+    --model ctm \
+    --dataset mazes-medium \
+    --log_dir logs/baseline_rectified \
+    --d_model 2048 \
+    --d_input 512 \
+    --heads 16 \
+    --n_synch_out 32 \
+    --n_synch_action 32 \
+    --neuron_select_type first-last \
+    --synapse_depth 8 \
+    --dropout 0.1 \
+    --batch_size 64 \
+    --training_iterations 100000 \
+    --device 0
+```
+
+Exp (Added Small World):
+```
+python -m tasks.mazes.train \
+    --model ctm \
+    --dataset mazes-medium \
+    --log_dir logs/small_world_added \
+    --d_model 2048 \
+    --d_input 512 \
+    --heads 16 \
+    --n_synch_out 528 \
+    --n_synch_action 528 \
+    --neuron_select_type small-world \
+    --connectivity 31 \
+    --rewiring_prob 0.2 \
+    --synapse_depth 8 \
+    --dropout 0.1 \
+    --batch_size 64 \
+    --training_iterations 100000 \
+    --device 0
+```
+
+Exp (Optimized Small World)
+```
+python -m tasks.mazes.train \
+    --model ctm \
+    --dataset mazes-medium \
+    --log_dir logs/small_world_optimized \
+    --d_model 2048 \
+    --d_input 512 \
+    --heads 16 \
+    --n_synch_out 4160 \
+    --n_synch_action 4160 \
+    --neuron_select_type small-world \
+    --connectivity 31 \
+    --rewiring_prob 0.2 \
+    --synapse_depth 4 \
+    --dropout 0.15 \
+    --memory_length 10 \
+    --memory_hidden_dims 256 \
+    --batch_size 64 \
+    --training_iterations 100000 \
+    --gradient_clipping 1.0 \
+    --device 0 \
+    --use_amp
+```
