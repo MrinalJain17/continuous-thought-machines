@@ -3,6 +3,7 @@ import torch
 import numpy as np
 import math
 from huggingface_hub import PyTorchModelHubMixin, hf_hub_download
+import networkx as nx
 
 from models.modules import ParityBackbone, SynapseUNET, Squeeze, SuperLinear, LearnableFourierPositionalEncoding, MultiLearnableFourierPositionalEncoding, CustomRotationalEmbedding, CustomRotationalEmbedding1D, ShallowWide
 from models.resnet import prepare_resnet_backbone
@@ -13,6 +14,65 @@ from models.constants import (
     VALID_BACKBONE_TYPES,
     VALID_POSITIONAL_EMBEDDING_TYPES
 )
+
+def generate_hub_spoke_topology(d_model, n_synch, rewiring_prob=0.3):
+    """
+    - 10% budget -> Core Self-Loops (Memory)
+    - 10% budget -> Core Ring (Sequence)
+    - Add Core Shortcuts (Decisions/Branching) with rewiring_prob
+    - Remaining budget -> Sensory Feeders (Input)
+    """
+    # Hubs (10% of edges)
+    n_hubs = max(2, int(n_synch * 0.1))
+    perm = torch.randperm(d_model)
+    hubs = perm[:n_hubs]
+    non_hubs = perm[n_hubs:] 
+
+    # Core: Self-Loops (Identity)
+    core_left, core_right = hubs, hubs
+
+    # Core: Lateral (Ring + Shortcuts)
+    # Ring: i -> i+1 (Guarantees structure)
+    ring_left = hubs
+    ring_right = torch.roll(hubs, shifts=-1, dims=0)
+
+    # Small World Shortcuts
+    G_ring_with_shortcuts = nx.newman_watts_strogatz_graph(n_hubs, k=2, p=rewiring_prob)
+    G_ring = nx.newman_watts_strogatz_graph(n_hubs, k=2, p=0.0)
+    shortcuts = nx.difference(G_ring_with_shortcuts, G_ring).edges()
+    if len(shortcuts):
+        short_sources, short_targets = zip(*shortcuts)
+        short_left = hubs[list(short_sources)]
+        short_right = hubs[list(short_targets)]
+
+        # Combine Lateral
+        lat_left = torch.cat([ring_left, short_left])
+        lat_right = torch.cat([ring_right, short_right])
+    else:
+        lat_left = ring_left
+        lat_right = ring_right
+
+    # Periphery: Feeders (Fill Budget)
+    n_used = len(core_left) + len(lat_left)
+    n_feed = max(0, n_synch - n_used)
+    
+    feed_src_indices = torch.randint(0, len(non_hubs), (n_feed,))
+    feed_left = non_hubs[feed_src_indices]
+    feed_right = hubs[torch.randint(0, n_hubs, (n_feed,))]
+
+    left = torch.cat([core_left, lat_left, feed_left])
+    right = torch.cat([core_right, lat_right, feed_right])
+    
+    # Type 0 = Core (Self + Ring + Shortcuts) -> Slow Decay
+    # Type 1 = Feeder -> Fast Decay
+    types = torch.cat([torch.zeros(n_used), torch.ones(n_feed)]).long()
+
+    decay_init = torch.zeros(n_synch)
+    decay_init[types == 0] = torch.normal(0.1, 0.05, size=(n_used,)) # Slow
+    decay_init[types == 1] = torch.normal(0.8, 0.15, size=(n_feed,)) # Fast
+
+    return left, right, decay_init.clamp(min=0.001), types
+
 
 class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
     """
@@ -133,8 +193,9 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         self.trace_processor = self.get_neuron_level_models(deep_nlms, do_layernorm_nlm, memory_length, memory_hidden_dims, d_model, dropout_nlm)
 
         #  --- Start States ---
-        self.register_parameter('start_activated_state', nn.Parameter(torch.zeros((d_model)).uniform_(-math.sqrt(1/(d_model)), math.sqrt(1/(d_model)))))
-        self.register_parameter('start_trace', nn.Parameter(torch.zeros((d_model, memory_length)).uniform_(-math.sqrt(1/(d_model+memory_length)), math.sqrt(1/(d_model+memory_length)))))
+        # We replace the standard uniform init (which leads to symmetry/rank collapse) with a high-variance normal distribution (std=0.1).
+        self.register_parameter('start_activated_state', nn.Parameter(torch.randn((d_model)) * 0.1))
+        self.register_parameter('start_trace', nn.Parameter(torch.randn((d_model, memory_length)) * 0.1))
 
         # --- Synchronisation ---
         self.neuron_select_type_out, self.neuron_select_type_action = self.get_neuron_select_type()
@@ -245,8 +306,8 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             i, j = torch.triu_indices(n_synch, n_synch)
             pairwise_product = outer[:, i, j]
             
-        elif self.neuron_select_type == 'random-pairing':
             # For random-pairing, we compute the sync between specific pairs of neurons
+        elif self.neuron_select_type in ('random-pairing', 'small-world'):
             left = activated_state[:, neuron_indices_left]
             right = activated_state[:, neuron_indices_right]
             pairwise_product = left * right
@@ -441,11 +502,20 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
                 neurons.
             """
             assert synch_type in ('out', 'action'), f"Invalid synch_type: {synch_type}"
-            left, right = self.initialize_left_right_neurons(synch_type, self.d_model, n_synch, n_random_pairing_self)
+            left, right, decay_init = self.initialize_left_right_neurons(synch_type, self.d_model, n_synch, n_random_pairing_self)
             synch_representation_size = self.synch_representation_size_action if synch_type == 'action' else self.synch_representation_size_out
             self.register_buffer(f'{synch_type}_neuron_indices_left', left)
             self.register_buffer(f'{synch_type}_neuron_indices_right', right)
-            self.register_parameter(f'decay_params_{synch_type}', nn.Parameter(torch.zeros(synch_representation_size), requires_grad=True))
+            
+            # Initialize decay parameters
+            decay_param = nn.Parameter(torch.zeros(synch_representation_size), requires_grad=True)
+            if decay_init is not None:
+                # We initialize parameters such that exp(-param) equals the desired decay.
+                # Thus, param = -ln(decay). 
+                with torch.no_grad():
+                    decay_param.data = decay_init
+                    
+            self.register_parameter(f'decay_params_{synch_type}', decay_param)
 
     def initialize_left_right_neurons(self, synch_type, d_model, n_synch, n_random_pairing_self=0):
         """
@@ -453,7 +523,14 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         This complexity is owing to legacy experiments, but we retain that these types of
         neuron selections are interesting to experiment with.
         """
-        if self.neuron_select_type=='first-last':
+        decay_init = None
+        device = self.start_activated_state.device
+
+        if self.neuron_select_type == 'small-world':
+            left, right, decay_init, _ = generate_hub_spoke_topology(d_model, n_synch)
+            return left.to(device), right.to(device), decay_init.to(device)
+
+        elif self.neuron_select_type == 'first-last':
             if synch_type == 'out':
                 neuron_indices_left = neuron_indices_right = torch.arange(0, n_synch)
             elif synch_type == 'action':
@@ -468,8 +545,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             neuron_indices_left = torch.from_numpy(np.random.choice(np.arange(d_model), size=n_synch))
             neuron_indices_right = torch.concatenate((neuron_indices_left[:n_random_pairing_self], torch.from_numpy(np.random.choice(np.arange(d_model), size=n_synch-n_random_pairing_self))))
 
-        device = self.start_activated_state.device
-        return neuron_indices_left.to(device), neuron_indices_right.to(device)
+        return neuron_indices_left.to(device), neuron_indices_right.to(device), decay_init
 
     def get_neuron_select_type(self):
         """
@@ -479,7 +555,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         print(f"Using neuron select type: {self.neuron_select_type}")
         if self.neuron_select_type == 'first-last':
             neuron_select_type_out, neuron_select_type_action = 'first', 'last'
-        elif self.neuron_select_type in ('random', 'random-pairing'):
+        elif self.neuron_select_type in ('random', 'random-pairing', 'small-world'):
             neuron_select_type_out = neuron_select_type_action = self.neuron_select_type
         else:
             raise ValueError(f"Invalid neuron selection type: {self.neuron_select_type}")
@@ -513,7 +589,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         """
         Calculate the size of the synchronisation representation based on neuron selection type.
         """
-        if self.neuron_select_type == 'random-pairing':
+        if self.neuron_select_type in ('random-pairing', 'small-world'):
             synch_representation_size = n_synch
         elif self.neuron_select_type in ('first-last', 'random'):
             synch_representation_size = (n_synch * (n_synch + 1)) // 2
@@ -539,7 +615,11 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         kv = self.compute_features(x)
 
         # --- Initialise Recurrent State ---
-        state_trace = self.start_trace.unsqueeze(0).expand(B, -1, -1) # Shape: (B, H, T)
+        # OPTIMIZATION: Use a Python list for the sliding window.
+        # This avoids the expensive 'torch.cat' and slicing operations inside the loop.
+        # We unbind the start trace into a list of M tensors, each shape (B, H).
+        history_buffer = list(self.start_trace.unsqueeze(0).expand(B, -1, -1).unbind(dim=-1))
+        
         activated_state = self.start_activated_state.unsqueeze(0).expand(B, -1) # Shape: (B, H)
 
         # --- Prepare Storage for Outputs per Iteration ---
@@ -570,8 +650,14 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
 
             # --- Apply Synapses ---
             state = self.synapses(pre_synapse_input)
-            # The 'state_trace' is the history of incoming pre-activations
-            state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
+            
+            # --- OPTIMIZATION: Update Buffer ---
+            # 1. Remove the oldest memory (Time t-M) - O(1) operation
+            history_buffer.pop(0)
+            # 2. Add the newest memory (Time t) - O(1) operation
+            history_buffer.append(state)
+            # 3. Stack into a tensor for the NLM (B, H, M) - Gradient safe
+            state_trace = torch.stack(history_buffer, dim=-1)
 
             # --- Apply Neuron-Level Models ---
             activated_state = self.trace_processor(state_trace)
@@ -591,7 +677,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
 
             # --- Tracking ---
             if track:
-                pre_activations_tracking.append(state_trace[:,:,-1].detach().cpu().numpy())
+                pre_activations_tracking.append(state.detach().cpu().numpy())
                 post_activations_tracking.append(activated_state.detach().cpu().numpy())
                 attention_tracking.append(attn_weights.detach().cpu().numpy())
                 synch_out_tracking.append(synchronisation_out.detach().cpu().numpy())

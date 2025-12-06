@@ -2,6 +2,13 @@ import argparse
 import os
 import random
 
+from rich.console import Console
+from rich.live import Live
+from rich.table import Table
+from rich.panel import Panel
+from rich.layout import Layout
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
@@ -10,20 +17,21 @@ import torch
 if torch.cuda.is_available():
     # For faster
     torch.set_float32_matmul_precision('high')
-from tqdm.auto import tqdm
 
 from data.custom_datasets import MazeImageFolder
 from models.ctm import ContinuousThoughtMachine
 from models.lstm import LSTMBaseline
 from models.ff import FFBaseline
-from tasks.mazes.plotting import make_maze_gif
-from tasks.image_classification.plotting import plot_neural_dynamics 
+from tasks.mazes.plotting import make_maze_gif, visualize_ctm_dashboard, visualize_topology_matrix, export_full_network
+from tasks.image_classification.plotting import plot_neural_dynamics
 from utils.housekeeping import set_seed, zip_python_code
 from utils.losses import maze_loss 
 from utils.schedulers import WarmupCosineAnnealingLR, WarmupMultiStepLR, warmup
 
 import torchvision
+
 torchvision.disable_beta_transforms_warning()
+console = Console()
 
 import warnings
 warnings.filterwarnings("ignore", message="using precomputed metric; inverse_transform will be unavailable")
@@ -46,6 +54,71 @@ warnings.filterwarnings(
     UserWarning,
     r"^PIL\.TiffImagePlugin$" # Using a regular expression to match the module.
 )
+
+
+def make_dashboard(iter_num, total_iters, loss, acc, grad_stats, vitals_stats, optim_stats, task_stats, pbar):
+    """Constructs the Live Dashboard"""
+    # Main Status Table
+    status_table = Table.grid(padding=(0, 2))
+    status_table.add_column(style="bold cyan", justify="right")
+    status_table.add_column(style="magenta")
+    
+    # Core Training
+    status_table.add_row("Iteration", f"{iter_num}/{total_iters}")
+    status_table.add_row("Loss", f"{loss:.4f}")
+    status_table.add_row("Accuracy", f"{acc:.4f}")
+    status_table.add_row("LR", f"{optim_stats.get('lr', 0.0):.6f}")
+    
+    # Gradient Norms (Unclipped / Clipped)
+    gu = optim_stats.get('gu', -1.0)
+    gc = optim_stats.get('gc', 0.0)
+    grad_str = f"GU:{gu:.2f} GC:{gc:.2f}" if gu != -1 else f"G:{gc:.2f}"
+    status_table.add_row("Gradients", grad_str)
+
+    # Task Stats (Time T and Length L)
+    if 't_val' in task_stats:
+        t_str = f"µ{task_stats['t_val']:.1f}±{task_stats['t_std']:.1f} [{task_stats['t_min']}-{task_stats['t_max']}]"
+        status_table.add_row("Time (T)", t_str)
+    
+    if 'l_mean' in task_stats:
+        l_str = f"µ{task_stats['l_mean']:.1f}±{task_stats['l_std']:.1f} [{task_stats['l_min']}-{task_stats['l_max']}]"
+        status_table.add_row("Len (L)", l_str)
+    
+    # Gradient Pulse Panel (Feeder Check)
+    grad_panel = Panel(
+        f"Core:      [green]{grad_stats.get('core', 0.0):.5f}[/]\n"
+        f"Periphery: [yellow]{grad_stats.get('periphery', 0.0):.5f}[/]",
+        title="Topology Grads",
+        border_style="blue"
+    )
+
+    # Vital Signs Panel
+    vitals_content = (
+        f"Energy: [bold]{vitals_stats.get('energy', 0.0):.4f}[/]\n"
+        f"Dead:   [red]{vitals_stats.get('dead', 0.0):.1f}%[/]\n"
+        f"Rank:   [cyan]{vitals_stats.get('rank', 0.0):.1f}[/]\n"
+        f"Wiggle: [bold blue]{vitals_stats.get('wiggle_index', 0.0):.2f}[/]\n"
+        f"Lateral:   [bold yellow]{vitals_stats.get('ring_strength', 0.0):.4f}[/]\n"
+        f"Leak:   [magenta]{vitals_stats.get('fast_core', 0.0):.1f}%[/]\n"
+        f"[dim]──────────────[/]\n"
+        f"r(Core): [bold green]{vitals_stats.get('r_core_mean', 0.0):.2f}[/]±[dim]{vitals_stats.get('r_core_std', 0.0):.2f}[/]\n"
+        f"r(Periphery): [bold cyan]{vitals_stats.get('r_peri_mean', 0.0):.2f}[/]±[dim]{vitals_stats.get('r_peri_std', 0.0):.2f}[/]"
+    )
+    vitals_panel = Panel(vitals_content, title="System Vitals", border_style="red")
+
+    # Layout
+    layout = Layout()
+    layout.split_column(
+        Layout(name="upper", ratio=1),
+        Layout(pbar)
+    )
+    layout["upper"].split_row(
+        Layout(Panel(status_table, title="Training Stats"), ratio=1),
+        Layout(grad_panel, ratio=1),
+        Layout(vitals_panel, ratio=1)
+    )
+
+    return layout
 
 
 def parse_args():
@@ -138,6 +211,9 @@ if __name__=='__main__':
 
     set_seed(args.seed, False)
     if not os.path.exists(args.log_dir): os.makedirs(args.log_dir)
+    diag_dir = f"{args.log_dir}/sw_diagnostics"
+    if not os.path.exists(diag_dir):
+        os.makedirs(diag_dir)
 
     assert args.dataset in ['mazes-medium', 'mazes-large', 'mazes-small']
 
@@ -231,6 +307,22 @@ if __name__=='__main__':
     num_workers_test = 1 # Defaulting to 1, can be changed
     trainloader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers_train, drop_last=True)
     testloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size_test, shuffle=True, num_workers=num_workers_test, drop_last=False)
+    train_eval_loader = torch.utils.data.DataLoader(
+        train_data, 
+        batch_size=args.batch_size_test,
+        shuffle=True,
+        num_workers=num_workers_test,
+        drop_last=True,
+        persistent_workers=True
+    )
+    test_eval_loader = torch.utils.data.DataLoader(
+        test_data, 
+        batch_size=args.batch_size_test,
+        shuffle=True, 
+        num_workers=num_workers_test,
+        drop_last=True,
+        persistent_workers=True
+    )
 
     # For lazy modules so that we can get param count
     
@@ -240,10 +332,17 @@ if __name__=='__main__':
     # Optimizer and scheduler
     decay_params = []
     no_decay_params = []
+    special_lr_params = [] # Group 3: High LR, No Weight Decay (Small-World)
+    
     no_decay_names = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
-            continue # Skip parameters that don't require gradients
+            continue
+            
+        # Check for Small-World Decay Params FIRST (High LR)
+        if "decay_params" in name:
+            special_lr_params.append(param)
+            continue
         if any(exclusion_str in name for exclusion_str in args.weight_decay_exclusion_list):
             no_decay_params.append(param)
             no_decay_names.append(name)
@@ -252,17 +351,23 @@ if __name__=='__main__':
     if len(no_decay_names):
         print(f'WARNING, excluding: {no_decay_names}')
 
-    # Optimizer and scheduler (Common setup)
-    if len(no_decay_names) and args.weight_decay!=0:
-        optimizer = torch.optim.AdamW([{'params': decay_params, 'weight_decay':args.weight_decay},
-                                       {'params': no_decay_params, 'weight_decay':0}],
-                                  lr=args.lr,
-                                  eps=1e-8 if not args.use_amp else 1e-6)
-    else:
-        optimizer = torch.optim.AdamW(model.parameters(),
-                                    lr=args.lr,
-                                    eps=1e-8 if not args.use_amp else 1e-6,
-                                    weight_decay=args.weight_decay)
+    # Construct Parameter Groups
+    param_groups = []
+    
+    if len(decay_params) > 0:
+        param_groups.append({'params': decay_params, 'weight_decay': args.weight_decay})
+        
+    if len(no_decay_params) > 0:
+        param_groups.append({'params': no_decay_params, 'weight_decay': 0.0})
+        
+    if len(special_lr_params) > 0:
+        param_groups.append({'params': special_lr_params, 'weight_decay': 0.0, 'lr': args.lr * 1.0})
+
+    optimizer = torch.optim.AdamW(
+        param_groups,
+        lr=args.lr, # Default LR for groups that don't specify it
+        eps=1e-8 if not args.use_amp else 1e-6
+    )
 
     warmup_schedule = warmup(args.warmup_steps)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warmup_schedule.step)
@@ -335,16 +440,43 @@ if __name__=='__main__':
     if args.do_compile:
         print('Compiling...')
         if hasattr(model, 'backbone'):
-            model.backbone = torch.compile(model.backbone, mode='reduce-overhead', fullgraph=True)
-        # Compile synapses only for CTM
+            model.backbone = torch.compile(model.backbone, mode='default', fullgraph=True)
+        # Compile synapses and NLMs only for CTM
         if args.model == 'ctm':
-            model.synapses = torch.compile(model.synapses, mode='reduce-overhead', fullgraph=True)
+            model.synapses = torch.compile(model.synapses, mode='default', fullgraph=True)
+            model.trace_processor = torch.compile(model.trace_processor, mode='default', fullgraph=True)
+
+    if args.model == 'ctm' and hasattr(model, 'out_neuron_indices_left'):
+        export_full_network(model, save_path=f"{args.log_dir}/sw_full_network.graphml")
+        visualize_topology_matrix(model, save_path=f"{args.log_dir}/topology_matrix_global.png")
 
     # Training
+    grad_stats = {'core': 0.0, 'periphery': 0.0}
+    vitals_stats = {
+        'r_core_mean': 0.0, 'r_core_std': 0.0,
+        'r_peri_mean': 0.0, 'r_peri_std': 0.0,
+        'energy': 0.0, 'dead': 0.0,
+        'rank': 0.0, 'fast_core': 0.0,
+        'ring_strength': 0.0, 'wiggle_index': 0.0,
+    }
+    optim_stats = {'lr': 0.0, 'gu': -1.0, 'gc': 0.0}
+    task_stats = {} # Will be populated dynamically
+    
+    current_loss = 0.0
+    current_acc = 0.0
+    job_progress = Progress(
+        "{task.description}",
+        SpinnerColumn(),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+    )
+    task_id = job_progress.add_task("[green]Training...[/]", total=args.training_iterations)
     iterator = iter(trainloader)
-    with tqdm(total=args.training_iterations, initial=start_iter, leave=False, position=0, dynamic_ncols=True) as pbar:
+    with Live(refresh_per_second=4) as live:
         for bi in range(start_iter, args.training_iterations):
-            current_lr = optimizer.param_groups[-1]['lr']
+            optim_stats['lr'] = optimizer.param_groups[0]['lr']
 
             try:
                 inputs, targets = next(iterator)
@@ -370,8 +502,8 @@ if __name__=='__main__':
 
             # Model-specific forward, reshape, and loss calculation
             with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", dtype=torch.float16, enabled=args.use_amp):
-                if args.do_compile: # CUDAGraph marking applied if compiling any model
-                     torch.compiler.cudagraph_mark_step_begin()
+                # if args.do_compile: # CUDAGraph marking applied if compiling any model
+                #      torch.compiler.cudagraph_mark_step_begin()
 
                 if args.model == 'ctm':
                     # CTM output: (B, SeqLength*5, Ticks), Certainties: (B, Ticks)
@@ -405,50 +537,101 @@ if __name__=='__main__':
 
                 # Extract stats from loss outputs if they are tensors
                 if torch.is_tensor(where_most_certain):
-                    where_most_certain_val = where_most_certain.float().mean().item()
-                    where_most_certain_std = where_most_certain.float().std().item()
-                    where_most_certain_min = where_most_certain.min().item()
-                    where_most_certain_max = where_most_certain.max().item()
-                elif isinstance(where_most_certain, int): # Handle case where it might return -1 directly
-                     where_most_certain_val = float(where_most_certain)
-                     where_most_certain_min = where_most_certain
-                     where_most_certain_max = where_most_certain
+                    task_stats['t_val'] = where_most_certain.float().mean().item()
+                    task_stats['t_std'] = where_most_certain.float().std().item()
+                    task_stats['t_min'] = where_most_certain.min().item()
+                    task_stats['t_max'] = where_most_certain.max().item()
 
-                if isinstance(upto_where, (np.ndarray, list)) and len(upto_where) > 0: # Check if it's a list/array
-                    upto_where_mean = np.mean(upto_where)
-                    upto_where_std = np.std(upto_where)
-                    upto_where_min = np.min(upto_where)
-                    upto_where_max = np.max(upto_where)
+                if isinstance(upto_where, (np.ndarray, list)) and len(upto_where) > 0:
+                    task_stats['l_mean'] = np.mean(upto_where)
+                    task_stats['l_std'] = np.std(upto_where)
+                    task_stats['l_min'] = np.min(upto_where)
+                    task_stats['l_max'] = np.max(upto_where)
 
 
             scaler.scale(loss).backward()
 
-            if args.gradient_clipping!=-1: 
+            # --- Gradient Pulse  ---
+            # Assessing if Feeder Lines (p=3.0) are receiving credit or vanishing.
+            if bi % 100 == 0:
+                with torch.no_grad():
+                    if hasattr(model, 'decay_params_out') and model.decay_params_out.grad is not None:
+                        d_params = model.decay_params_out.grad
+                        left = model.out_neuron_indices_left
+                        right = model.out_neuron_indices_right
+                        
+                        self_loop_mask = (left == right)
+                        hub_indices = torch.unique(left[self_loop_mask])
+                        
+                        # Core = Source is Hub AND Target is Hub
+                        is_source_hub = torch.isin(left, hub_indices)
+                        is_target_hub = torch.isin(right, hub_indices)
+                        is_core = is_source_hub & is_target_hub
+
+                        scale = scaler.get_scale()
+                        grad_stats['core'] = d_params[is_core].norm().item() / scale
+                        grad_stats['periphery'] = d_params[~is_core].norm().item() / scale
+
+            optim_stats['gu'] = -1.0
+            if args.gradient_clipping != -1:
                 scaler.unscale_(optimizer)
+                unclipped_norm = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        unclipped_norm += p.grad.detach().data.norm(2).item() ** 2
+                optim_stats['gu'] = unclipped_norm ** 0.5
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.gradient_clipping)
 
             scaler.step(optimizer)
+            
+            # --- Monitor Clipped Gradient ---
+            grad_norm = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    grad_norm += p.grad.detach().data.norm(2).item() ** 2
+            optim_stats['gc'] = grad_norm ** 0.5
+
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
 
-            # Conditional Tqdm Description
-            pbar_desc = f'Loss={loss.item():0.3f}. Acc(step)={accuracy_finegrained:0.3f}. LR={current_lr:0.6f}.'
-            if args.model in ['ctm', 'lstm'] or torch.is_tensor(where_most_certain): # Show stats if available
-                 pbar_desc += f' Where_certain={where_most_certain_val:0.2f}+-{where_most_certain_std:0.2f} ({where_most_certain_min:d}<->{where_most_certain_max:d}).'
-            if isinstance(upto_where, (np.ndarray, list)) and len(upto_where) > 0:
-                 pbar_desc += f' Path pred stats: {upto_where_mean:0.2f}+-{upto_where_std:0.2f} ({upto_where_min:d} --> {upto_where_max:d})'
+            with torch.no_grad():
+                # Handle torch.compile or DDP wrapping
+                real_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+                real_model = real_model.module if hasattr(real_model, 'module') else real_model
 
-            pbar.set_description(f'Dataset={args.dataset}. Model={args.model}. {pbar_desc}')
+                if hasattr(real_model, 'decay_params_out'):
+                    left = real_model.out_neuron_indices_left
+                    right = real_model.out_neuron_indices_right
+                    
+                    self_loop_mask = (left == right)
+                    hub_indices = torch.unique(left[self_loop_mask])
+                    
+                    is_source_hub = torch.isin(left, hub_indices)
+                    is_target_hub = torch.isin(right, hub_indices)
+                    
+                    # CORE = Source is Hub AND Target is Hub
+                    # This captures both Self-Loops (H->H) and Ring (H->Next H)
+                    mask_core = is_source_hub & is_target_hub
+                    
+                    # PERIPHERY = Source is NOT a Hub (Input -> Hub)
+                    mask_peri = ~mask_core
+                    
+                    # Core (Memory + Ring): Force Slow Decay (0.001 - 0.4)
+                    real_model.decay_params_out[mask_core] = real_model.decay_params_out[mask_core].clamp(min=0.001, max=0.4)
+                    
+                    # Periphery (Feeders): Force Fast Decay (> 0.6)
+                    real_model.decay_params_out[mask_peri] = real_model.decay_params_out[mask_peri].clamp(min=0.6, max=3.0)
 
+                # Prevent explosion for action parameters
+                if hasattr(real_model, 'decay_params_action'):
+                    real_model.decay_params_action.clamp_(min=0.001)
 
             # Metrics tracking and plotting
             if bi%args.track_every==0 and (bi != 0 or args.reload_model_only):
+                job_progress.update(task_id, description="[yellow]Evaluating...[/]")
                 model.eval() # Use eval mode for consistency during tracking
                 with torch.inference_mode(): # Use inference mode for tracking
-
-                    
-
 
                     # --- Quantitative Metrics ---
                     iters.append(bi)
@@ -463,15 +646,13 @@ if __name__=='__main__':
                     current_test_accuracies_most_certain_permaze_eval = []
 
                     # TRAIN METRICS
-                    pbar.set_description('Tracking: Computing TRAIN metrics')
-                    loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size_test, shuffle=True, num_workers=num_workers_test) # Use consistent num_workers
                     all_targets_list = []
                     all_predictions_list = [] # Per step/tick predictions argmax (N, S, T) or (N, S)
                     all_predictions_most_certain_list = [] # Predictions at chosen step/tick argmax (N, S)
                     all_losses = []
 
-                    with tqdm(total=len(loader), initial=0, leave=False, position=1, dynamic_ncols=True) as pbar_inner:
-                        for inferi, (inputs, targets) in enumerate(loader):
+                    if 1:  # To avoid de-indenting due to removed tqdm ctx
+                        for inferi, (inputs, targets) in enumerate(train_eval_loader):
                             inputs = inputs.to(device)
                             targets = targets.to(device)
                             all_targets_list.append(targets.detach().cpu().numpy()) # N x S
@@ -504,8 +685,6 @@ if __name__=='__main__':
                             all_losses.append(loss.item())
 
                             if args.n_test_batches != -1 and inferi >= args.n_test_batches -1 : break
-                            pbar_inner.set_description(f'Computing metrics for train (Batch {inferi+1})')
-                            pbar_inner.update(1)
 
                     all_targets = np.concatenate(all_targets_list) # N, S
                     all_predictions = np.concatenate(all_predictions_list) # N, S, T or N, S
@@ -527,15 +706,13 @@ if __name__=='__main__':
 
 
                     # TEST METRICS
-                    pbar.set_description('Tracking: Computing TEST metrics')
-                    loader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size_test, shuffle=True, num_workers=num_workers_test)
                     all_targets_list = []
                     all_predictions_list = []
                     all_predictions_most_certain_list = []
                     all_losses = []
 
-                    with tqdm(total=len(loader), initial=0, leave=False, position=1, dynamic_ncols=True) as pbar_inner:
-                        for inferi, (inputs, targets) in enumerate(loader):
+                    if 1:  # To avoid de-indenting due to removed tqdm ctx
+                        for inferi, (inputs, targets) in enumerate(test_eval_loader):
                             inputs = inputs.to(device)
                             targets = targets.to(device)
                             all_targets_list.append(targets.detach().cpu().numpy())
@@ -568,8 +745,6 @@ if __name__=='__main__':
                             all_losses.append(loss.item())
 
                             if args.n_test_batches != -1 and inferi >= args.n_test_batches -1: break
-                            pbar_inner.set_description(f'Computing metrics for test (Batch {inferi+1})')
-                            pbar_inner.update(1)
 
                     all_targets = np.concatenate(all_targets_list)
                     all_predictions = np.concatenate(all_predictions_list)
@@ -648,7 +823,7 @@ if __name__=='__main__':
                             longest_index = (targets_viz!=4).sum(-1).argmax() # Action 4 assumed padding/end
 
                             # Track internal states
-                            predictions_viz_raw, certainties_viz, _, pre_activations_viz, post_activations_viz, attention_tracking_viz = model(inputs_viz, track=True)
+                            predictions_viz_raw, certainties_viz, (synch_out_viz, _), pre_activations_viz, post_activations_viz, attention_tracking_viz = model(inputs_viz, track=True)
 
                             # Reshape predictions (assuming raw is B, D, T)
                             predictions_viz = predictions_viz_raw.reshape(predictions_viz_raw.size(0), -1, 5, predictions_viz_raw.size(-1)) # B, S, C, T
@@ -662,21 +837,134 @@ if __name__=='__main__':
                             plot_neural_dynamics(post_activations_viz, 100, args.log_dir, axis_snap=True)
 
                             # Create maze GIF (task-specific plotting)
-                            make_maze_gif((inputs_viz[longest_index].detach().cpu().numpy()+1)/2,
+                            wiggle_index = make_maze_gif((inputs_viz[longest_index].detach().cpu().numpy()+1)/2,
                                           predictions_viz[longest_index].detach().cpu().numpy(), # Pass reshaped B,S,C,T -> S,C,T
                                           targets_viz[longest_index].detach().cpu().numpy(), # S
                                           attention_tracking_viz[:, longest_index],  # Pass T, (H), H, W
                                           args.log_dir)
+
+                            # --- Small-World Health Check ---
+                            if hasattr(model, 'out_neuron_indices_left'):
+                                decay = np.exp(-model.decay_params_out.detach().cpu().numpy())
+                                left = model.out_neuron_indices_left.detach().cpu().numpy()
+                                right = model.out_neuron_indices_right.detach().cpu().numpy()
+                                activity_np = synch_out_viz  # (Time, Batch, Edges)
+
+                                # Identify Core Memory (Self-Loops: i -> i)
+                                mask_self_loops = (left == right)
+                                
+                                # Identify Hub Indices from Self-Loops
+                                if mask_self_loops.any():
+                                    hub_indices = np.unique(left[mask_self_loops])
+                                else:
+                                    hub_indices = np.array([])
+
+                                # Identify Ring Connections (Hub -> Hub, but not i -> i)
+                                is_source_hub = np.isin(left, hub_indices)
+                                is_target_hub = np.isin(right, hub_indices)
+                                mask_ring = is_source_hub & is_target_hub & (~mask_self_loops)
+
+                                # Identify Feeders (Non-Hub -> Hub)
+                                # Strictly speaking, anything that originates from a non-hub is a feeder
+                                mask_feeders = (~is_source_hub)
+
+                                # View A: For Rank & Dead Check (Batch, Edges)
+                                # We average over Time (Axis 0) to get the "Average Thought" per sample
+                                activity_over_time = np.abs(activity_np).mean(axis=0) 
+                                
+                                # View B: For Ring Integrity & Plots (Time, Edges)
+                                # We average over Batch (Axis 1) to get the "Trajectory"
+                                activity_over_batch = np.abs(activity_np).mean(axis=1)
+
+                                # --- Calculate Vitals ---
+                                
+                                # A. Ring Integrity
+                                # Measures if Hubs are actually talking to each other
+                                if mask_ring.any():
+                                    ring_integrity = np.abs(activity_over_batch[:, mask_ring]).mean()
+                                else:
+                                    ring_integrity = 0.0
+
+                                # B. Energy/Death
+                                mean_act = activity_over_time.mean()
+                                dead_pct = (activity_over_time.mean(axis=0) < 1e-6).mean() * 100
+                                
+                                # C. Effective Rank (The Blob Check)
+                                if mask_self_loops.any():
+                                    target_activity = activity_over_time[:, mask_self_loops] # (Batch, Hubs)
+                                else:
+                                    target_activity = activity_over_time
+                                try:
+                                    _, S, _ = np.linalg.svd(target_activity)
+                                    S_norm = S / (S.sum() + 1e-9)
+                                    effective_rank = np.exp(-np.sum(S_norm * np.log(S_norm + 1e-9)))
+                                    vitals_stats['singular_values'] = S_norm
+                                except:
+                                    effective_rank = 0.0
+                                    vitals_stats['singular_values'] = np.zeros(10)
+
+                                # D. Granular Decay Rates (Latency Risk Check)
+                                # We check drift on Self-Loops (Memory Stability)
+                                if mask_self_loops.any():
+                                    r_core = decay[mask_self_loops]
+                                    r_core_mean = r_core.mean().item()
+                                    r_core_std = r_core.std().item()
+                                    fast_core_pct = (np.sum(r_core < 0.67) / len(r_core)) * 100
+                                else:
+                                    r_core_mean, r_core_std, fast_core_pct = 0.0, 0.0, 0.0
+
+                                if mask_feeders.any():
+                                    r_peri = decay[mask_feeders]
+                                    r_peri_mean = r_peri.mean().item()
+                                    r_peri_std = r_peri.std().item()
+                                else:
+                                    r_peri_mean, r_peri_std = 0.0, 0.0
+
+                                # Update State for Dashboard
+                                vitals_stats.update({
+                                    'r_core_mean': r_core_mean, 'r_core_std': r_core_std,
+                                    'r_peri_mean': r_peri_mean, 'r_peri_std': r_peri_std,
+                                    'fast_core': fast_core_pct,
+                                    'energy': mean_act,
+                                    'dead': dead_pct,
+                                    'rank': effective_rank,
+                                    'ring_strength': ring_integrity,
+                                    'wiggle_index': wiggle_index,
+                                })
+
+                                visualize_ctm_dashboard(
+                                    model,
+                                    activity_over_batch,
+                                    vitals_stats, 
+                                    f"{args.log_dir}/sw_diagnostics/sw", 
+                                    bi
+                                )
                         #  except Exception as e:
                         #       print(f"Visualization failed for model {args.model}: {e}")
                     # --- End Visualization ---
 
+                job_progress.update(task_id, description="[green]Training...[/]")
                 model.train() # Switch back to train mode
+            
+            # --- UI UPDATE ---
+            current_loss = loss.item()
+            current_acc = accuracy_finegrained
+            job_progress.update(task_id, advance=1)
+            
+            # Re-render the dashboard
+            live.update(make_dashboard(
+                bi, args.training_iterations, 
+                current_loss, current_acc, 
+                grad_stats, 
+                vitals_stats, 
+                optim_stats, 
+                task_stats, 
+                job_progress
+            ))
 
 
             # Save model checkpoint
             if (bi % args.save_every == 0 or bi == args.training_iterations - 1) and bi != start_iter:
-                pbar.set_description('Saving model checkpoint...')
                 checkpoint_data = {
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
@@ -700,5 +988,3 @@ if __name__=='__main__':
                     'random_rng_state': random.getstate(),
                 }
                 torch.save(checkpoint_data, f'{args.log_dir}/checkpoint.pt')
-
-            pbar.update(1)

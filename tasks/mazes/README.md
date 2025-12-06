@@ -14,3 +14,76 @@ We also provide a 'mazes-small' dataset (see [here](https://drive.google.com/fil
 ```
 python -m tasks.mazes.train --dataset mazes-small --maze_route_length 50 --cirriculum_lookahead 5  --model ctm --d_model 1024 --d_input 256 --backbone_type resnet18-1 --synapse_depth 8 --heads 4 --n_synch_out 128 --n_synch_action 128 --neuron_select_type random-pairing --memory_length 25 --iterations 50 --training_iterations 100001 --lr 1e-4 --batch_size 64 --batch_size_test 32 --n_test_batches 50 --log_dir logs/mazes-small-tester --track_every 2000
 ```
+
+## Small world
+
+(Assumed) Baseline:
+```
+python -m tasks.mazes.train \
+    --dataset mazes-medium \
+    --log_dir logs/baseline \
+    --model ctm \
+    --d_model 2048 \
+    --dropout 0.1 \
+    --backbone_type resnet34-2 \
+    --d_input 512 \
+    --heads 16 \
+    --iterations 75 \
+    --synapse_depth 8 \
+    --n_synch_out 32 \
+    --n_synch_action 32 \
+    --neuron_select_type first-last \
+    --memory_length 25 \
+    --memory_hidden_dims 32 \
+    --batch_size 64 \
+    --training_iterations 100000
+```
+
+Exp (SW) - Medium:
+```
+python -m tasks.mazes.train \
+    --dataset mazes-medium \
+    --log_dir logs/sw_medium_maze \
+    --model ctm \
+    --d_model 2048 \
+    --dropout 0.1 \
+    --backbone_type resnet34-2 \
+    --d_input 512 \
+    --heads 16 \
+    --iterations 75 \
+    --synapse_depth 8 \
+    --n_synch_out 528 \
+    --n_synch_action 528 \
+    --neuron_select_type small-world \
+    --memory_length 25 \
+    --memory_hidden_dims 32 \
+    --batch_size 64 \
+    --training_iterations 100000 \
+    --device 0 --use_amp --do_compile
+```
+
+Exp (SW) - Small:
+```
+python -m tasks.mazes.train \
+    --dataset mazes-small \
+    --log_dir logs/sw_small_maze \
+    --model ctm \
+    --d_model 1024 \
+    --dropout 0.1 \
+    --backbone_type resnet18-1 \
+    --d_input 256 \
+    --heads 4 \
+    --iterations 50 \
+    --synapse_depth 8 \
+    --n_synch_out 128 \
+    --n_synch_action 128 \
+    --neuron_select_type small-world \
+    --memory_length 25 \
+    --memory_hidden_dims 32 \
+    --maze_route_length 50 \
+    --batch_size 128 \
+    --batch_size_test 128 \
+    --training_iterations 50000 \
+    --n_test_batches 50 \
+    --device 0 --use_amp --do_compile
+```

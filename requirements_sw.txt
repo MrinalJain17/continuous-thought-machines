@@ -1,0 +1,7 @@
+seaborn
+opencv-python
+imageio
+umap-learn
+datasets
+huggingface_hub
+safetensors

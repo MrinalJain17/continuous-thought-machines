@@ -5,10 +5,9 @@ from models.constants import VALID_NEURON_SELECT_TYPES, VALID_BACKBONE_TYPES, VA
 import numpy as np
 
 def rep_size(neuron_select_type: str, n_synch: int) -> int:
-    return n_synch if neuron_select_type == "random-pairing" else n_synch * (n_synch + 1) // 2
-
-def rep_size(neuron_select_type: str, n_synch: int) -> int:
-    return n_synch if neuron_select_type == "random-pairing" else n_synch * (n_synch + 1) // 2
+    if neuron_select_type in ["random-pairing", "small-world"]:
+        return n_synch
+    return n_synch * (n_synch + 1) // 2
 
 def grab_synch_tensors(model, s_type: str):
     if s_type == "out":
@@ -99,7 +98,7 @@ def test_golden_rl(golden_test_model_rl, golden_test_inputs_rl, golden_test_expe
 # --- General CTM Tests ---
 
 @pytest.mark.parametrize("synch_type", ["out", "action"])
-@pytest.mark.parametrize("neuron_select_type", ["first-last", "random", "random-pairing"])
+@pytest.mark.parametrize("neuron_select_type", ["first-last", "random", "random-pairing", "small-world"])
 def test_set_synchronisation_parameters(ctm_factory, base_params, device, synch_type, neuron_select_type):
     np.random.seed(0)
     n_synch = 8
@@ -137,6 +136,8 @@ def test_set_synchronisation_parameters(ctm_factory, base_params, device, synch_
         pass
     elif neuron_select_type == "random-pairing":
         assert torch.equal(right[:num_random_pairing_self], left[:num_random_pairing_self])
+    elif neuron_select_type == "small-world":
+        assert (left == right).sum() == max(2, int(n_synch * 0.1)), "Hub count mismatch"
 
 # ------ Neuron Select Type Test ---
 
