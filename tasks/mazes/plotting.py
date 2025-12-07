@@ -231,42 +231,61 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     right = model.out_neuron_indices_right.cpu().numpy()
     is_hub = (left == right)
     
-    # --- PLOT 1: The "Twin Peaks" Histogram (Structure) ---
-    plt.figure(figsize=(10, 5))
-    sns.histplot(decay_params[is_hub], color="blue", label="Hubs (Memory)", kde=True, bins=30, alpha=0.6)
-    sns.histplot(decay_params[~is_hub], color="orange", label="Lattice (Broadcast)", kde=True, bins=30, alpha=0.6)
+    # --- PLOT 1: Structure (Histogram) - LOG SCALE ---
+    plt.figure(figsize=(10, 6)) # Slightly taller for annotations
     
-    plt.title(f"Topology Structure at Step {step_num}\n(Left Peak=Memory, Right Peak=Broadcast)")
+    ax = sns.histplot(decay_params[is_hub], color="blue", label="Hubs (Memory)", kde=False, bins=60, alpha=0.6)
+    sns.histplot(decay_params[~is_hub], color="orange", label="Lattice (Broadcast)", kde=False, bins=60, alpha=0.6)
+
+    plt.yscale('log')
+    
+    # 2. Add "Physics" Annotations
+    # Decay ~0.1 means ~10 steps memory. Decay ~1.0 means ~1 step.
+    ylim = ax.get_ylim()
+    plt.vlines(x=[0.1, 1.0], ymin=ylim[0], ymax=ylim[1], colors='gray', linestyles='--', alpha=0.3)
+    plt.text(0.1, ylim[1]*0.5, "Corridor\n(~10 steps)", ha='center', color='gray', fontsize=9)
+    plt.text(1.0, ylim[1]*0.5, "Instant\n(~1 step)", ha='center', color='gray', fontsize=9)
+    plt.text(0.0, ylim[1]*0.8, "Infinite\n(Global)", ha='left', color='blue', fontsize=9)
+
+    plt.title(f"Topology Structure at Step {step_num}\n(Log Scale reveals the hidden 'Corridor Layer')")
     plt.xlabel("Decay Rate")
+    plt.ylabel("Count (Log Scale)")
     plt.legend()
-    plt.grid(True, alpha=0.3)
+    plt.grid(True, alpha=0.3, which="both") # 'both' grids for log scale
     plt.savefig(f"{save_prefix}_structure_{step_num}.png")
     plt.close()
 
-    # --- PLOT 2: The "Split-Brain" Heatmap (Behavior) ---
-    # synch_out_viz shape: (Iterations, Batch, Pairs)
-    # We want average over Batch -> (Iterations, Pairs)
-    activity_avg = synch_out_viz.mean(axis=1)
+    # --- PLOT 2: Behavior (Heatmap) - SORTED ---
+    # synch_out_viz shape: (Iterations, Batch, Pairs) -> Mean over Batch -> (Iterations, Pairs)
+    activity_avg = synch_out_viz.mean(axis=1) 
     
     # Transpose to get (Pairs, Time) for heatmap
     # activity_avg.T -> (Pairs, Iterations)
     hubs_activity = activity_avg[:, is_hub].T 
-    lattice_activity = activity_avg[:, ~is_hub].T
     
-    # Downsample lattice to match hub count
-    if lattice_activity.shape[0] > hubs_activity.shape[0]:
-        indices = np.linspace(0, lattice_activity.shape[0]-1, hubs_activity.shape[0], dtype=int)
-        lattice_activity = lattice_activity[indices, :]
-        
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+    # 2. Extract Lattice Data AND Decay Values
+    lattice_activity = activity_avg[:, ~is_hub].T
+    lattice_decays = decay_params[~is_hub]
+    
+    # This groups 'Corridor Neurons' (Low Decay) at the top, 'Broadcast Neurons' (High Decay) at bottom
+    sort_indices = np.argsort(lattice_decays)
+    lattice_activity_sorted = lattice_activity[sort_indices, :]
+    
+    # 4. Downsample (Preserving the sorted gradient)
+    if lattice_activity_sorted.shape[0] > hubs_activity.shape[0]:
+        # We take a uniform linspace so we see samples from the whole spectrum
+        indices = np.linspace(0, lattice_activity_sorted.shape[0]-1, hubs_activity.shape[0], dtype=int)
+        lattice_activity_sorted = lattice_activity_sorted[indices, :]
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
     
     sns.heatmap(hubs_activity, ax=ax1, cmap="magma", cbar=True, vmin=0, vmax=2.0)
-    ax1.set_title("Hub Activity (Expectation: Horizontal Streaks)")
+    ax1.set_title("Hub Activity (Tier 1: Infinite Global Memory)")
     ax1.set_ylabel("Hub Neurons")
     
-    sns.heatmap(lattice_activity, ax=ax2, cmap="viridis", cbar=True, vmin=0, vmax=2.0)
-    ax2.set_title("Lattice Activity (Expectation: Vertical Pulses)")
-    ax2.set_ylabel("Lattice Connections")
+    sns.heatmap(lattice_activity_sorted, ax=ax2, cmap="viridis", cbar=True, vmin=0, vmax=2.0)
+    ax2.set_title("Lattice Activity (Sorted by Decay)\nTop: Tier 2 (Corridor Memory) -> Bottom: Tier 3 (Instant Broadcast)")
+    ax2.set_ylabel("Lattice Connections\n(Low Decay -> High Decay)")
     ax2.set_xlabel("Time Steps")
     
     plt.tight_layout()

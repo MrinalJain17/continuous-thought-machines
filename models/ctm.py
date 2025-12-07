@@ -675,7 +675,11 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         kv = self.compute_features(x)
 
         # --- Initialise Recurrent State ---
-        state_trace = self.start_trace.unsqueeze(0).expand(B, -1, -1) # Shape: (B, H, T)
+        # OPTIMIZATION: Use a Python list for the sliding window.
+        # This avoids the expensive 'torch.cat' and slicing operations inside the loop.
+        # We unbind the start trace into a list of M tensors, each shape (B, H).
+        history_buffer = list(self.start_trace.unsqueeze(0).expand(B, -1, -1).unbind(dim=-1))
+        
         activated_state = self.start_activated_state.unsqueeze(0).expand(B, -1) # Shape: (B, H)
 
         # --- Prepare Storage for Outputs per Iteration ---
@@ -706,8 +710,14 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
 
             # --- Apply Synapses ---
             state = self.synapses(pre_synapse_input)
-            # The 'state_trace' is the history of incoming pre-activations
-            state_trace = torch.cat((state_trace[:, :, 1:], state.unsqueeze(-1)), dim=-1)
+            
+            # --- OPTIMIZATION: Update Buffer ---
+            # 1. Remove the oldest memory (Time t-M) - O(1) operation
+            history_buffer.pop(0)
+            # 2. Add the newest memory (Time t) - O(1) operation
+            history_buffer.append(state)
+            # 3. Stack into a tensor for the NLM (B, H, M) - Gradient safe
+            state_trace = torch.stack(history_buffer, dim=-1)
 
             # --- Apply Neuron-Level Models ---
             activated_state = self.trace_processor(state_trace)
@@ -727,7 +737,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
 
             # --- Tracking ---
             if track:
-                pre_activations_tracking.append(state_trace[:,:,-1].detach().cpu().numpy())
+                pre_activations_tracking.append(state.detach().cpu().numpy())
                 post_activations_tracking.append(activated_state.detach().cpu().numpy())
                 attention_tracking.append(attn_weights.detach().cpu().numpy())
                 synch_out_tracking.append(synchronisation_out.detach().cpu().numpy())
