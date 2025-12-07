@@ -351,12 +351,12 @@ if __name__=='__main__':
 
     if args.do_compile:
         print('Compiling...')
-        model = torch.compile(model, mode='reduce-overhead')
-        # if hasattr(model, 'backbone'):
-        #     model.backbone = torch.compile(model.backbone, mode='reduce-overhead', fullgraph=True)
-        # # Compile synapses only for CTM
-        # if args.model == 'ctm':
-        #     model.synapses = torch.compile(model.synapses, mode='reduce-overhead', fullgraph=True)
+        if hasattr(model, 'backbone'):
+            model.backbone = torch.compile(model.backbone, mode='reduce-overhead', fullgraph=True)
+        # Compile synapses and NLMs only for CTM
+        if args.model == 'ctm':
+            model.synapses = torch.compile(model.synapses, mode='reduce-overhead', fullgraph=True)
+            model.trace_processor = torch.compile(model.trace_processor, mode='reduce-overhead', fullgraph=True)
 
     # Training
     iterator = iter(trainloader)
