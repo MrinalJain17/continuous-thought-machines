@@ -455,9 +455,6 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             if decay_init is not None:
                 # We initialize parameters such that exp(-param) equals the desired decay.
                 # Thus, param = -ln(decay). 
-                # Note: The forward pass uses exp(-param), so positive params mean decay.
-                # Local (0.1) -> -ln(0.1) ~= 2.3. Global (1.0) -> -ln(1.0) = 0.
-                # Caution: The code likely uses clamping or exp logic. Assuming standard logic:
                 with torch.no_grad():
                     decay_param.data = decay_init
                     
@@ -595,7 +592,14 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         # Map types to initialization values
         # 1.0 (Rewired Type) -> 1.0 (Transient/Coincidence Detection)
         # 0.0 (Lattice Type) -> 0.1 (Working Memory)
-        decay_init = torch.where(all_decay_types > 0.5, torch.tensor(1.0, device=device), torch.tensor(0.1, device=device))
+        # Map types to the CORRECT NEGATIVE LOG parameter values (param = -ln(r_desired)).
+        LOG_10 = 0.0 # -ln(1.0) = 0.0 (Target for Rewired)
+        LOG_01 = 2.302585 # -ln(0.1) ~ 2.302 (Target for Lattice)
+        decay_init = torch.where(
+            all_decay_types > 0.5,
+            torch.tensor(LOG_10, device=device),  # Rewired (intended r=1.0) -> param=0.0
+            torch.tensor(LOG_01, device=device)   # Lattice (intended r=0.1) -> param=2.302
+        )
 
         # Add noise to allow learning diversity
         decay_init += torch.randn_like(decay_init) * 0.01

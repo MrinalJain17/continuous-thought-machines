@@ -306,6 +306,7 @@ def visualize_topology_circle(model, save_path="sw_topology.png"):
     """
     left = model.out_neuron_indices_left.cpu().numpy()
     right = model.out_neuron_indices_right.cpu().numpy()
+    decay_params = model.decay_params_out.cpu().detach().numpy()
     
     # Filter for Clarity (Plot Top 32 Hubs Only)
     unique_hubs = np.unique(left)
@@ -316,33 +317,33 @@ def visualize_topology_circle(model, save_path="sw_topology.png"):
     sources = left[mask]
     targets = right[mask]
     
-    # 3. Build Graph
+    # Get the functional decay value for the filtered edges
+    edge_decay_values = decay_params[mask]
+    
+    # Build Graph
     G = nx.DiGraph()
     active_nodes = np.unique(np.concatenate([sources, targets]))
-    
-    # Add Edges & Colors
-    edge_colors = []
-    for s, t in zip(sources, targets):
-        G.add_edge(s, t)
-        
-        # Color Logic:
-        # Blue = Anchor (Self-Loop)
-        # Green = Chain (Neighbor / Lattice)
-        # Red = Scout (Distant / Rewired)
-        
-        if s == t:
-            edge_colors.append('blue')
-        else:
-            # Calculate Ring Distance
-            dist = abs(s - t)
-            dist = min(dist, model.d_model - dist) 
-            
-            if dist < (model.d_model * 0.05): 
-                edge_colors.append('green') 
-            else:
-                edge_colors.append('red')   
 
-    # 4. Draw
+    # We use strict thresholds based on the fixed initialization values:
+    # Tiers 1 and 3 are initialized near 0.0 (Infinite/Transient)
+    # Tier 2 is initialized near 2.302 (Working Memory)
+    edge_colors = []
+    for i, (s, t) in enumerate(zip(sources, targets)):
+        G.add_edge(s, t)
+        decay_value = edge_decay_values[i]
+
+        if s == t or decay_value < 0.01:
+            # Tiers 1 & 3: Anchor (Self-Loop) / Scout (Rewired) 
+            # Both are param ~ 0.0, indicating the highest possible retention (r=1.0).
+            edge_colors.append('blue') 
+        elif decay_value > 2.0: 
+            # Tier 2: Chain/Lattice (param ~ 2.302)
+            edge_colors.append('green') 
+        else:
+            # Catch noisy remainders (use red for consistency)
+            edge_colors.append('red') 
+
+    # Draw
     plt.figure(figsize=(10, 10))
     # Circular Layout based on Neuron Index
     pos = {n: (np.cos(2*np.pi*n/model.d_model), np.sin(2*np.pi*n/model.d_model)) for n in active_nodes}
@@ -352,9 +353,9 @@ def visualize_topology_circle(model, save_path="sw_topology.png"):
     
     # Legend
     legend_elements = [
-        Line2D([0], [0], color='blue', lw=2, label='Anchor (Identity)'),
+        Line2D([0], [0], color='blue', lw=2, label='Anchor/Scout'),
         Line2D([0], [0], color='green', lw=2, label='Chain (Lattice)'),
-        Line2D([0], [0], color='red', lw=2, label='Scout (Rewired)')
+        Line2D([0], [0], color='red', lw=2, label='Remainder/Noise')
     ]
     plt.legend(handles=legend_elements, loc='upper right')
     
