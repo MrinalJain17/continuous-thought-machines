@@ -244,14 +244,15 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     ax = sns.histplot(decay_params[~is_hub], color="orange", label="Lattice (Broadcast)", kde=False, bins=60, alpha=0.6)
     
     plt.yscale('log') # Log Scale to reveal the small "Corridor" bump between 0.1 and 0.5
-    ylim = ax.get_ylim()
-    plt.vlines(x=[0.1, 1.0], ymin=ylim[0], ymax=ylim[1], colors='gray', linestyles='--', alpha=0.3)
+    plt.xlim(-0.05, 1.05)
 
-    text_y = 10**(np.log10(ylim[1]) * 0.85)
+    ylim = ax.get_ylim()
+    text_y = 10**(np.log10(ylim[1]) * 0.90)
+    ax.text(0.02, 0.95, "Infinite\n(Global)", transform=ax.transAxes, ha='left', va='top', color='blue', fontsize=9, fontweight='bold')
     plt.text(0.1, text_y, "Corridor\n(~10 steps)", ha='center', va='bottom', color='gray', fontsize=9, fontweight='bold')
     plt.text(1.0, text_y, "Instant\n(~1 step)", ha='center', va='bottom', color='gray', fontsize=9, fontweight='bold')
-    plt.text(0.02, text_y, "Infinite\n(Global)", ha='left', va='bottom', color='blue', fontsize=9, fontweight='bold')
 
+    plt.vlines(x=[0.1, 1.0], ymin=ylim[0], ymax=ylim[1], colors='gray', linestyles='--', alpha=0.3)
     plt.title(f"Topology Structure at Step {step_num}\n(Log Scale reveals the hidden 'Corridor Layer')")
     plt.xlabel("Decay Rate")
     plt.ylabel("Count (Log Scale)")
