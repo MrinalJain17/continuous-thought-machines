@@ -217,53 +217,58 @@ def make_maze_gif(inputs, predictions, targets, attention_tracking, save_locatio
 
 def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_num):
     """
-    Generates diagnostics using the captured synchronization history.
+    Generates diagnostics for Small-World CTM.
+    1. Histogram: Log-scale to reveal 'Corridor Memory' population.
+    2. Heatmap: Sorted by decay to visualize functional hierarchy (Hubs -> Corridor -> Broadcast).
     
     Args:
-        model: The CTM model (for indices/params)
-        synch_out_viz: NumPy array of shape (Iterations, Batch, Pairs)
-        save_prefix: Path prefix for saving images
-        step_num: Current iteration number
+        model: CTM model (for indices/params)
+        synch_out_viz: NumPy array (Iterations, Batch, Pairs) from the test batch
+        save_prefix: Path prefix
+        step_num: Iteration number
     """
-    # 1. Get Params & Indices (From Model)
     decay_params = model.decay_params_out.detach().cpu().numpy()
     left = model.out_neuron_indices_left.cpu().numpy()
     right = model.out_neuron_indices_right.cpu().numpy()
     is_hub = (left == right)
     
-    # --- PLOT 1: Structure (Histogram) - LOG SCALE ---
-    plt.figure(figsize=(10, 6)) # Slightly taller for annotations
+    # =========================================================
+    # PLOT 1: Topology Structure (Log-Scale Histogram)
+    # =========================================================
+    plt.figure(figsize=(10, 6))
     
-    ax = sns.histplot(decay_params[is_hub], color="blue", label="Hubs (Memory)", kde=False, bins=60, alpha=0.6)
-    sns.histplot(decay_params[~is_hub], color="orange", label="Lattice (Broadcast)", kde=False, bins=60, alpha=0.6)
-
-    plt.yscale('log')
+    # Plot Hubs (Blue) - usually a sharp peak at 0
+    sns.histplot(decay_params[is_hub], color="blue", label="Hubs (Memory)", kde=False, bins=60, alpha=0.6)
+    # Plot Lattice (Orange) - usually a bimodal distribution
+    ax = sns.histplot(decay_params[~is_hub], color="orange", label="Lattice (Broadcast)", kde=False, bins=60, alpha=0.6)
     
-    # 2. Add "Physics" Annotations
-    # Decay ~0.1 means ~10 steps memory. Decay ~1.0 means ~1 step.
+    plt.yscale('log') # Log Scale to reveal the small "Corridor" bump between 0.1 and 0.5
     ylim = ax.get_ylim()
     plt.vlines(x=[0.1, 1.0], ymin=ylim[0], ymax=ylim[1], colors='gray', linestyles='--', alpha=0.3)
-    plt.text(0.1, ylim[1]*0.5, "Corridor\n(~10 steps)", ha='center', color='gray', fontsize=9)
-    plt.text(1.0, ylim[1]*0.5, "Instant\n(~1 step)", ha='center', color='gray', fontsize=9)
-    plt.text(0.0, ylim[1]*0.8, "Infinite\n(Global)", ha='left', color='blue', fontsize=9)
+
+    text_y = 10**(np.log10(ylim[1]) * 0.5) 
+    plt.text(0.1, text_y, "Corridor\n(~10 steps)", ha='center', color='gray', fontsize=9, fontweight='bold')
+    plt.text(1.0, text_y, "Instant\n(~1 step)", ha='center', color='gray', fontsize=9, fontweight='bold')
+    plt.text(0.01, text_y, "Infinite\n(Global)", ha='left', color='blue', fontsize=9, fontweight='bold')
 
     plt.title(f"Topology Structure at Step {step_num}\n(Log Scale reveals the hidden 'Corridor Layer')")
     plt.xlabel("Decay Rate")
     plt.ylabel("Count (Log Scale)")
-    plt.legend()
-    plt.grid(True, alpha=0.3, which="both") # 'both' grids for log scale
+    plt.legend(loc='upper right')
+    plt.grid(True, alpha=0.3, which="both")
     plt.savefig(f"{save_prefix}_structure_{step_num}.png")
     plt.close()
 
-    # --- PLOT 2: Behavior (Heatmap) - SORTED ---
+    # =========================================================
+    # PLOT 2: Neural Behavior (Sorted Heatmap)
+    # =========================================================
     # synch_out_viz shape: (Iterations, Batch, Pairs) -> Mean over Batch -> (Iterations, Pairs)
     activity_avg = synch_out_viz.mean(axis=1) 
     
     # Transpose to get (Pairs, Time) for heatmap
-    # activity_avg.T -> (Pairs, Iterations)
     hubs_activity = activity_avg[:, is_hub].T 
     
-    # 2. Extract Lattice Data AND Decay Values
+    # B. Extract Lattice Data & Decay Values
     lattice_activity = activity_avg[:, ~is_hub].T
     lattice_decays = decay_params[~is_hub]
     
@@ -271,21 +276,21 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     sort_indices = np.argsort(lattice_decays)
     lattice_activity_sorted = lattice_activity[sort_indices, :]
     
-    # 4. Downsample (Preserving the sorted gradient)
+    # D. Downsample Lattice to match Hub height (for clean side-by-side plotting)
+    # We take a uniform linspace so we see samples from the whole spectrum (Corridor -> Broadcast)
     if lattice_activity_sorted.shape[0] > hubs_activity.shape[0]:
-        # We take a uniform linspace so we see samples from the whole spectrum
         indices = np.linspace(0, lattice_activity_sorted.shape[0]-1, hubs_activity.shape[0], dtype=int)
         lattice_activity_sorted = lattice_activity_sorted[indices, :]
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
     
     sns.heatmap(hubs_activity, ax=ax1, cmap="magma", cbar=True, vmin=0, vmax=2.0)
-    ax1.set_title("Hub Activity (Tier 1: Infinite Global Memory)")
+    ax1.set_title("Tier 1: Hub Activity (Infinite Global Memory)")
     ax1.set_ylabel("Hub Neurons")
     
     sns.heatmap(lattice_activity_sorted, ax=ax2, cmap="viridis", cbar=True, vmin=0, vmax=2.0)
-    ax2.set_title("Lattice Activity (Sorted by Decay)\nTop: Tier 2 (Corridor Memory) -> Bottom: Tier 3 (Instant Broadcast)")
-    ax2.set_ylabel("Lattice Connections\n(Low Decay -> High Decay)")
+    ax2.set_title("Tier 2 & 3: Lattice Activity (Sorted by Decay)\n(Top = Corridor Memory, Bottom = Instant Broadcast)")
+    ax2.set_ylabel("Lattice Connections\n(Low Decay $\\to$ High Decay)")
     ax2.set_xlabel("Time Steps")
     
     plt.tight_layout()
