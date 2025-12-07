@@ -163,3 +163,55 @@ def test_decay_initialization_priors(ctm_factory, base_params, device):
     
     assert has_lattice, "Missing Lattice (Local) decay priors (~0.1)"
     assert has_rewired, "Missing Rewired (Global) decay priors (~1.0)"
+
+
+# --- 4. Dynamic Safety Tests ---
+# These tests run a full forward/backward pass to ensure that
+# performance optimizations (like List+Stack memory) do not break Autograd.
+
+def test_memory_gradient_flow(ctm_factory, base_params, device):
+    """
+    Verifies that gradients correctly propagate backwards through the
+    manual 'List + Stack' memory buffer optimization.
+    
+    If this fails, the 'history_buffer' logic has detached the graph,
+    and the model is not learning from past timesteps.
+    """
+    # 1. Setup a small, trainable model
+    # We need enough iterations to force the buffer to cycle (pop/append)
+    iterations = 10 
+    memory_length = 5 
+    
+    model = ctm_factory(
+        base_params,
+        d_model=128,          # Small dim
+        memory_length=memory_length,
+        iterations=iterations,
+        neuron_select_type='small-world'
+    ).to(device)
+    
+    # 2. Forward Pass
+    # Input: (Batch=2, Channels=3, H=32, W=32)
+    x = torch.randn(2, 3, 32, 32).to(device)
+    
+    # Enable gradient tracking for inputs/weights
+    model.train()
+    predictions, _, _ = model(x)
+    
+    # 3. Backward Pass
+    # We optimize a dummy loss
+    loss = predictions.sum()
+    loss.backward()
+    
+    # 4. THE CHECK: Does 'start_trace' have a gradient?
+    # 'start_trace' is the parameter that initializes the history buffer.
+    # If the gradient reaches here, it means it successfully flowed back 
+    # through all 'torch.stack' and 'list.append' operations in the loop.
+    
+    assert model.start_trace.grad is not None, \
+        "Gradient flow broken: 'start_trace' received no gradient."
+        
+    # Optional: Check magnitude to ensure it's not vanishing to exact zero
+    grad_mag = model.start_trace.grad.abs().sum().item()
+    assert grad_mag > 0.0, \
+        f"Gradient flow vanished: 'start_trace' gradient sum is {grad_mag}"
