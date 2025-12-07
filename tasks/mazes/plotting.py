@@ -3,10 +3,11 @@ import numpy as np
 import cv2
 import torch
 import os
-import matplotlib.pyplot as plt 
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 import imageio
 import seaborn as sns
-
+import networkx as nx
 from tqdm.auto import tqdm
 
 def find_center_of_mass(array_2d):
@@ -246,10 +247,10 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     ylim = ax.get_ylim()
     plt.vlines(x=[0.1, 1.0], ymin=ylim[0], ymax=ylim[1], colors='gray', linestyles='--', alpha=0.3)
 
-    text_y = 10**(np.log10(ylim[1]) * 0.5) 
-    plt.text(0.1, text_y, "Corridor\n(~10 steps)", ha='center', color='gray', fontsize=9, fontweight='bold')
-    plt.text(1.0, text_y, "Instant\n(~1 step)", ha='center', color='gray', fontsize=9, fontweight='bold')
-    plt.text(0.01, text_y, "Infinite\n(Global)", ha='left', color='blue', fontsize=9, fontweight='bold')
+    text_y = 10**(np.log10(ylim[1]) * 0.85)
+    plt.text(0.1, text_y, "Corridor\n(~10 steps)", ha='center', va='bottom', color='gray', fontsize=9, fontweight='bold')
+    plt.text(1.0, text_y, "Instant\n(~1 step)", ha='center', va='bottom', color='gray', fontsize=9, fontweight='bold')
+    plt.text(0.02, text_y, "Infinite\n(Global)", ha='left', va='bottom', color='blue', fontsize=9, fontweight='bold')
 
     plt.title(f"Topology Structure at Step {step_num}\n(Log Scale reveals the hidden 'Corridor Layer')")
     plt.xlabel("Decay Rate")
@@ -295,4 +296,70 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     
     plt.tight_layout()
     plt.savefig(f"{save_prefix}_behavior_{step_num}.png")
+    plt.close()
+
+
+def visualize_topology_circle(model, save_path="sw_topology.png"):
+    """
+    Visualizes the Small-World connectivity of the CTM.
+    Plots a subset of Hubs in a ring to highlight the 'Lattice' vs 'Rewired' structure.
+    """
+    left = model.out_neuron_indices_left.cpu().numpy()
+    right = model.out_neuron_indices_right.cpu().numpy()
+    
+    # Filter for Clarity (Plot Top 32 Hubs Only)
+    unique_hubs = np.unique(left)
+    selected_hubs = unique_hubs[:32] 
+    
+    # Filter edges originating from these hubs
+    mask = np.isin(left, selected_hubs)
+    sources = left[mask]
+    targets = right[mask]
+    
+    # 3. Build Graph
+    G = nx.DiGraph()
+    active_nodes = np.unique(np.concatenate([sources, targets]))
+    
+    # Add Edges & Colors
+    edge_colors = []
+    for s, t in zip(sources, targets):
+        G.add_edge(s, t)
+        
+        # Color Logic:
+        # Blue = Anchor (Self-Loop)
+        # Green = Chain (Neighbor / Lattice)
+        # Red = Scout (Distant / Rewired)
+        
+        if s == t:
+            edge_colors.append('blue')
+        else:
+            # Calculate Ring Distance
+            dist = abs(s - t)
+            dist = min(dist, model.d_model - dist) 
+            
+            if dist < (model.d_model * 0.05): 
+                edge_colors.append('green') 
+            else:
+                edge_colors.append('red')   
+
+    # 4. Draw
+    plt.figure(figsize=(10, 10))
+    # Circular Layout based on Neuron Index
+    pos = {n: (np.cos(2*np.pi*n/model.d_model), np.sin(2*np.pi*n/model.d_model)) for n in active_nodes}
+    
+    nx.draw_networkx_nodes(G, pos, node_size=20, node_color='black')
+    nx.draw_networkx_edges(G, pos, edge_color=edge_colors, alpha=0.5, arrows=True, width=1.0)
+    
+    # Legend
+    legend_elements = [
+        Line2D([0], [0], color='blue', lw=2, label='Anchor (Identity)'),
+        Line2D([0], [0], color='green', lw=2, label='Chain (Lattice)'),
+        Line2D([0], [0], color='red', lw=2, label='Scout (Rewired)')
+    ]
+    plt.legend(handles=legend_elements, loc='upper right')
+    
+    plt.title(f"Small-World Topology Snapshot\n(Showing {len(selected_hubs)} Hubs)")
+    plt.axis('off')
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
     plt.close()
