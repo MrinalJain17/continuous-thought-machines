@@ -50,15 +50,15 @@ Structure alone isn't enough; the connections need to know *how long* to hold on
 
       * *The Logic:* These neurons act as "Perfect Integrators." They are designed to hold the global context (e.g., "Goal is North") indefinitely without fading.
 
-  2. **The Chain (Lattice $\to$ Long Memory):**
-    I initialize neighbor connections with a decay of **\~0.1** (roughly 10 steps).
+  2. **The Chain (Lattice $\to$ Working Memory):**
+    I initialize neighbor connections to have an exponential decay factor of **~0.1** (roughly 10 steps).
 
       * *The Logic:* These handle "Corridor Memory." If you are walking down a hallway, you need to remember your heading for a few seconds, but not forever.
 
-  3. **The Scouts (Rewired $\to$ Instant Memory):**
-    I initialize the long-range shortcuts with a decay of **\~1.0** (Instant).
+  3. **The Scouts (Rewired $\to$ Global Anchors):**
+    I initialize the long-range shortcuts to have an exponential decay factor of **~0.0**.
 
-      * *The Logic:* These are "Coincidence Detectors." They flash a signal (e.g., "I see the exit\!") and reset immediately. They transmit alerts, not history.
+      * *The Logic:* These act as powerful global signal integrators, reinforcing the Hubs' global context. By connecting across the entire manifold, they ensure the highest priority signals (like the Goal) are instantly distributed and retained at the maximum strength across the entire latent space.
 
 #### Validation: The "Drift" Failure
 
