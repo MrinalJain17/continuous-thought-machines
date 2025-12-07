@@ -235,6 +235,22 @@ if __name__=='__main__':
     num_workers_test = 1 # Defaulting to 1, can be changed
     trainloader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers_train, drop_last=True)
     testloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size_test, shuffle=True, num_workers=num_workers_test, drop_last=False)
+    train_eval_loader = torch.utils.data.DataLoader(
+        train_data, 
+        batch_size=args.batch_size_test,
+        shuffle=True,
+        num_workers=num_workers_test,
+        drop_last=True,
+        persistent_workers=True
+    )
+    test_eval_loader = torch.utils.data.DataLoader(
+        test_data, 
+        batch_size=args.batch_size_test,
+        shuffle=True, 
+        num_workers=num_workers_test,
+        drop_last=True,
+        persistent_workers=True
+    )
 
     # For lazy modules so that we can get param count
     
@@ -482,14 +498,13 @@ if __name__=='__main__':
 
                     # TRAIN METRICS
                     pbar.set_description('Tracking: Computing TRAIN metrics')
-                    loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size_test, shuffle=True, num_workers=num_workers_test) # Use consistent num_workers
                     all_targets_list = []
                     all_predictions_list = [] # Per step/tick predictions argmax (N, S, T) or (N, S)
                     all_predictions_most_certain_list = [] # Predictions at chosen step/tick argmax (N, S)
                     all_losses = []
 
-                    with tqdm(total=len(loader), initial=0, leave=False, position=1, dynamic_ncols=True) as pbar_inner:
-                        for inferi, (inputs, targets) in enumerate(loader):
+                    with tqdm(total=len(train_eval_loader), initial=0, leave=False, position=1, dynamic_ncols=True) as pbar_inner:
+                        for inferi, (inputs, targets) in enumerate(train_eval_loader):
                             inputs = inputs.to(device)
                             targets = targets.to(device)
                             all_targets_list.append(targets.detach().cpu().numpy()) # N x S
@@ -546,14 +561,13 @@ if __name__=='__main__':
 
                     # TEST METRICS
                     pbar.set_description('Tracking: Computing TEST metrics')
-                    loader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size_test, shuffle=True, num_workers=num_workers_test)
                     all_targets_list = []
                     all_predictions_list = []
                     all_predictions_most_certain_list = []
                     all_losses = []
 
-                    with tqdm(total=len(loader), initial=0, leave=False, position=1, dynamic_ncols=True) as pbar_inner:
-                        for inferi, (inputs, targets) in enumerate(loader):
+                    with tqdm(total=len(test_eval_loader), initial=0, leave=False, position=1, dynamic_ncols=True) as pbar_inner:
+                        for inferi, (inputs, targets) in enumerate(test_eval_loader):
                             inputs = inputs.to(device)
                             targets = targets.to(device)
                             all_targets_list.append(targets.detach().cpu().numpy())

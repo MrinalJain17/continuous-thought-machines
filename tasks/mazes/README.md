@@ -36,28 +36,7 @@ python -m tasks.mazes.train \
     --device 0
 ```
 
-Exp (Added Small World):
-```
-python -m tasks.mazes.train \
-    --model ctm \
-    --dataset mazes-medium \
-    --log_dir logs/small_world_added \
-    --d_model 2048 \
-    --d_input 512 \
-    --heads 16 \
-    --n_synch_out 528 \
-    --n_synch_action 528 \
-    --neuron_select_type small-world \
-    --connectivity 31 \
-    --rewiring_prob 0.2 \
-    --synapse_depth 8 \
-    --dropout 0.1 \
-    --batch_size 64 \
-    --training_iterations 100000 \
-    --device 0
-```
-
-Exp (Optimized Small World)
+Exp (Small World):
 ```
 python -m tasks.mazes.train \
     --model ctm \
