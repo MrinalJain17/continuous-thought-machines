@@ -16,7 +16,7 @@ from data.custom_datasets import MazeImageFolder
 from models.ctm import ContinuousThoughtMachine
 from models.lstm import LSTMBaseline
 from models.ff import FFBaseline
-from tasks.mazes.plotting import make_maze_gif
+from tasks.mazes.plotting import make_maze_gif, visualize_small_world_diagnostics
 from tasks.image_classification.plotting import plot_neural_dynamics 
 from utils.housekeeping import set_seed, zip_python_code
 from utils.losses import maze_loss 
@@ -273,8 +273,7 @@ if __name__=='__main__':
         param_groups.append({'params': no_decay_params, 'weight_decay': 0.0})
         
     if len(special_lr_params) > 0:
-        # 10x Learning Rate for decay params to encourage temporal specialization
-        param_groups.append({'params': special_lr_params, 'weight_decay': 0.0, 'lr': args.lr * 10.0})
+        param_groups.append({'params': special_lr_params, 'weight_decay': 0.0, 'lr': args.lr})
 
     optimizer = torch.optim.AdamW(
         param_groups,
@@ -666,7 +665,7 @@ if __name__=='__main__':
                             longest_index = (targets_viz!=4).sum(-1).argmax() # Action 4 assumed padding/end
 
                             # Track internal states
-                            predictions_viz_raw, certainties_viz, _, pre_activations_viz, post_activations_viz, attention_tracking_viz = model(inputs_viz, track=True)
+                            predictions_viz_raw, certainties_viz, (synch_out_viz, _), pre_activations_viz, post_activations_viz, attention_tracking_viz = model(inputs_viz, track=True)
 
                             # Reshape predictions (assuming raw is B, D, T)
                             predictions_viz = predictions_viz_raw.reshape(predictions_viz_raw.size(0), -1, 5, predictions_viz_raw.size(-1)) # B, S, C, T
@@ -685,30 +684,26 @@ if __name__=='__main__':
                                           targets_viz[longest_index].detach().cpu().numpy(), # S
                                           attention_tracking_viz[:, longest_index],  # Pass T, (H), H, W
                                           args.log_dir)
+
                             # --- Small-World Health Check ---
-                            if bi % args.track_every == 0 and hasattr(model, 'out_neuron_indices_left'):
-                                with torch.no_grad():
-                                    # 1. Decay Parameter Check
-                                    decay = model.decay_params_out
-                                    is_self = (model.out_neuron_indices_left == model.out_neuron_indices_right)
-                                    log_msg = f"[Iter {bi}]"
-                                    
-                                    # 2. Hub Health (Energy Check)
-                                    # We check the 'synchronisation' output for the Self-Pairs.
-                                    if is_self.any():
-                                        # Energy = z dot z. If this is 0, the hub is dead.
-                                        hub_energy = synchronisation[:, is_self].mean().item()
-                                        
-                                        # Decay stats
-                                        self_decay = decay[is_self].mean().item()
-                                        other_decay = decay[~is_self].mean().item()
-                                        
-                                        log_msg += f" Hub Energy: {hub_energy:.5f} | Decay: Self={self_decay:.3f} / Other={other_decay:.3f}"
-                                    else:
-                                        # Fallback for baseline (random-pairing)
-                                        mean_sync = synchronisation.mean().item()
-                                        log_msg += f" Mean Synch: {mean_sync:.5f}"
-                                    tqdm.write(log_msg)
+                            if hasattr(model, 'out_neuron_indices_left'):
+                                visualize_small_world_diagnostics(model, synch_out_viz, f"{args.log_dir}/sw_diag", bi)
+
+                                decay = model.decay_params_out
+                                is_self = (model.out_neuron_indices_left == model.out_neuron_indices_right)
+                                log_msg = f"[Iter {bi}]"
+                                
+                                if is_self.any():
+                                    # synch_out_viz is (Time, Batch, Pairs) numpy array
+                                    # We average over Time and Batch
+                                    hub_energy = synch_out_viz[:, :, is_self.cpu().numpy()].mean()
+                                    self_decay = decay[is_self].mean().item()
+                                    other_decay = decay[~is_self].mean().item()
+                                    log_msg += f" Hub Energy: {hub_energy:.5f} | Decay: Self={self_decay:.3f} / Other={other_decay:.3f}"
+                                else:
+                                    log_msg += f" Mean Synch: {synch_out_viz.mean():.5f}"
+                                tqdm.write(log_msg)
+
                         #  except Exception as e:
                         #       print(f"Visualization failed for model {args.model}: {e}")
                     # --- End Visualization ---

@@ -5,6 +5,7 @@ import torch
 import os
 import matplotlib.pyplot as plt 
 import imageio
+import seaborn as sns
 
 from tqdm.auto import tqdm
 
@@ -212,3 +213,62 @@ def make_maze_gif(inputs, predictions, targets, attention_tracking, save_locatio
     fig.savefig(f'{save_location}/route_approximation.png', dpi=200)
     imageio.mimsave(f'{save_location}/prediction.gif', frames, fps=15, loop=100)
     plt.close(fig)
+
+
+def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_num):
+    """
+    Generates diagnostics using the captured synchronization history.
+    
+    Args:
+        model: The CTM model (for indices/params)
+        synch_out_viz: NumPy array of shape (Iterations, Batch, Pairs)
+        save_prefix: Path prefix for saving images
+        step_num: Current iteration number
+    """
+    # 1. Get Params & Indices (From Model)
+    decay_params = model.decay_params_out.detach().cpu().numpy()
+    left = model.out_neuron_indices_left.cpu().numpy()
+    right = model.out_neuron_indices_right.cpu().numpy()
+    is_hub = (left == right)
+    
+    # --- PLOT 1: The "Twin Peaks" Histogram (Structure) ---
+    plt.figure(figsize=(10, 5))
+    sns.histplot(decay_params[is_hub], color="blue", label="Hubs (Memory)", kde=True, bins=30, alpha=0.6)
+    sns.histplot(decay_params[~is_hub], color="orange", label="Lattice (Broadcast)", kde=True, bins=30, alpha=0.6)
+    
+    plt.title(f"Topology Structure at Step {step_num}\n(Left Peak=Memory, Right Peak=Broadcast)")
+    plt.xlabel("Decay Rate")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.savefig(f"{save_prefix}_structure_{step_num}.png")
+    plt.close()
+
+    # --- PLOT 2: The "Split-Brain" Heatmap (Behavior) ---
+    # synch_out_viz shape: (Iterations, Batch, Pairs)
+    # We want average over Batch -> (Iterations, Pairs)
+    activity_avg = synch_out_viz.mean(axis=1)
+    
+    # Transpose to get (Pairs, Time) for heatmap
+    # activity_avg.T -> (Pairs, Iterations)
+    hubs_activity = activity_avg[:, is_hub].T 
+    lattice_activity = activity_avg[:, ~is_hub].T
+    
+    # Downsample lattice to match hub count
+    if lattice_activity.shape[0] > hubs_activity.shape[0]:
+        indices = np.linspace(0, lattice_activity.shape[0]-1, hubs_activity.shape[0], dtype=int)
+        lattice_activity = lattice_activity[indices, :]
+        
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+    
+    sns.heatmap(hubs_activity, ax=ax1, cmap="magma", cbar=True, vmin=0, vmax=2.0)
+    ax1.set_title("Hub Activity (Expectation: Horizontal Streaks)")
+    ax1.set_ylabel("Hub Neurons")
+    
+    sns.heatmap(lattice_activity, ax=ax2, cmap="viridis", cbar=True, vmin=0, vmax=2.0)
+    ax2.set_title("Lattice Activity (Expectation: Vertical Pulses)")
+    ax2.set_ylabel("Lattice Connections")
+    ax2.set_xlabel("Time Steps")
+    
+    plt.tight_layout()
+    plt.savefig(f"{save_prefix}_behavior_{step_num}.png")
+    plt.close()
