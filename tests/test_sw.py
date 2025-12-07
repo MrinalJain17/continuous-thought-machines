@@ -155,11 +155,12 @@ def test_decay_initialization_priors(ctm_factory, base_params, device):
     other_decays = decay_params[other_mask]
     
     # We simply check that we have a bimodal distribution
-    # Some should be ~0.1 (Lattice), some ~1.0 (Rewired)
+    # Lattice (r=0.1) requires param ~ 2.30
+    # Rewired (r=1.0) requires param ~ 0.0
     # Note: Noise is +/- 0.01
     
-    has_lattice = torch.any((other_decays > 0.05) & (other_decays < 0.15))
-    has_rewired = torch.any((other_decays > 0.95) & (other_decays < 1.05))
+    has_lattice = torch.any((other_decays > 2.25) & (other_decays < 2.35))
+    has_rewired = torch.any((other_decays > -0.05) & (other_decays < 0.05))
     
     assert has_lattice, "Missing Lattice (Local) decay priors (~0.1)"
     assert has_rewired, "Missing Rewired (Global) decay priors (~1.0)"
