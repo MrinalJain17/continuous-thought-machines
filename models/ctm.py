@@ -525,7 +525,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         # Self-Pairs
         self_left = hubs
         self_right = hubs
-        self_decay = torch.zeros(num_hubs, device=device) # Local = 0.0
+        self_decay = torch.zeros(num_hubs, device=device) # Placeholder
 
         # Neighbors
         offsets = torch.cat([
@@ -540,12 +540,9 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         # Create source indices matching targets
         sources = hubs.unsqueeze(1).expand(-1, actual_k)
         
-        # DEBUG PRINT
-        print(f"DEBUG: Generating Small World. k={k}, p={p}")
         # Vectorized Rewiring
         # Generate random mask for rewiring (p)
         rand_mask = torch.rand(lattice_targets.shape, device=device) < p
-        print(f"DEBUG: Mask Mean (Rewired %): {rand_mask.float().mean().item():.4f}")
         
         # Generate random targets for where mask is True
         random_targets = torch.randint(0, d_model, lattice_targets.shape, device=device)
@@ -585,21 +582,32 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         if remainder > 0:
             fill_left = torch.randint(0, d_model, (remainder,), device=device)
             fill_right = torch.randint(0, d_model, (remainder,), device=device)
-            # Init remainder decay to noisy low
-            fill_decay = torch.zeros(remainder, device=device) 
+            
+            # CRITICAL FIX: Set remainder decay type to 2.0 (Noise)
+            # This prevents them from being classified as Lattice (0.0)
+            fill_decay = torch.full((remainder,), 2.0, device=device)
             
             all_left = torch.cat([all_left, fill_left])
             all_right = torch.cat([all_right, fill_right])
             all_decay_types = torch.cat([all_decay_types, fill_decay])
         
-        PARAM_INFINITE = 15.0  # r ~ 0.0
-        PARAM_WORKING = 2.302585  # r ~ 0.1
+        # --- Logic: Map Types to Parameters ---
+        # Type 0.0 -> Lattice -> PARAM_WORKING (2.3) -> Green
+        # Type 1.0 -> Rewired -> PARAM_INFINITE (15.0) -> Blue
+        # Type 2.0 -> Noise   -> PARAM_NOISE (0.0) -> Red
+        
+        PARAM_INFINITE = 15.0      # r ~ 0.0
+        PARAM_WORKING = 2.302585   # r ~ 0.1
+        PARAM_NOISE = 0.0          # r ~ 1.0 (Fast Decay)
 
-        decay_init = torch.where(
-            all_decay_types > 0.5,
-            torch.tensor(PARAM_INFINITE, device=device),  # Rewired
-            torch.tensor(PARAM_WORKING, device=device)    # Lattice
-        )
+        # Default to Lattice (Green)
+        decay_init = torch.full_like(all_decay_types, PARAM_WORKING)
+        
+        # Overwrite Rewired (Blue)
+        decay_init[all_decay_types == 1.0] = PARAM_INFINITE
+        
+        # Overwrite Noise (Red) - The 7 remainder edges go here
+        decay_init[all_decay_types == 2.0] = PARAM_NOISE
 
         # Add noise to allow learning diversity
         decay_init += torch.randn_like(decay_init) * 0.01
