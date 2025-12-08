@@ -589,12 +589,8 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             all_right = torch.cat([all_right, fill_right])
             all_decay_types = torch.cat([all_decay_types, fill_decay])
         
-        TARGET_R_INFINITE = 0.0  # For hubs and rewired shortcuts
-        TARGET_R_WORKING = 0.1   # For lattice connections
-
-        # Convert to decay_param (param = -ln(r), but handle r=0 specially)
-        PARAM_INFINITE = 15.0  # Max value, gives r ≈ 3e-7 ≈ 0
-        PARAM_WORKING = -np.log(TARGET_R_WORKING)  # ≈ 2.302
+        PARAM_INFINITE = 15.0  # r ~ 0.0
+        PARAM_WORKING = 2.302585  # r ~ 0.1
 
         decay_init = torch.where(
             all_decay_types > 0.5,
