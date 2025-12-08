@@ -16,7 +16,7 @@ from data.custom_datasets import MazeImageFolder
 from models.ctm import ContinuousThoughtMachine
 from models.lstm import LSTMBaseline
 from models.ff import FFBaseline
-from tasks.mazes.plotting import make_maze_gif, visualize_small_world_diagnostics, visualize_topology_circle
+from tasks.mazes.plotting import make_maze_gif, visualize_small_world_diagnostics, visualize_topology_matrix, export_to_gephi, export_full_network
 from tasks.image_classification.plotting import plot_neural_dynamics 
 from utils.housekeeping import set_seed, zip_python_code
 from utils.losses import maze_loss 
@@ -375,9 +375,11 @@ if __name__=='__main__':
             model.trace_processor = torch.compile(model.trace_processor, mode='reduce-overhead', fullgraph=True)
 
     if args.model == 'ctm' and hasattr(model, 'out_neuron_indices_left'):
-        visualize_topology_circle(
+        export_to_gephi(model, save_path=f"{args.log_dir}/sw_network.graphml")
+        export_full_network(model, save_path=f"{args.log_dir}/sw_full_network.graphml")
+        visualize_topology_matrix(
             model, 
-            save_path=f"{args.log_dir}/topology_structure.png"
+            save_path=f"{args.log_dir}/topology_matrix.png"
         )
 
     # Training
