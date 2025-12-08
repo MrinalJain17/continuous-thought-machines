@@ -319,8 +319,8 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     plt.close()
 
 
-def visualize_evolution_metrics(model, save_path="sw_evolution.png"):
-    activity = model.last_synch_out.detach().cpu()
+def visualize_evolution_metrics(model, synch_out_viz, save_path="sw_evolution.png"):
+    activity = synch_out_viz.detach().cpu()
     
     # 1. Hub Extraction (Safe Mode)
     left = model.out_neuron_indices_left.detach().cpu().numpy()

@@ -465,28 +465,44 @@ if __name__=='__main__':
 
             scaler.scale(loss).backward()
 
+            unclipped_norm_for_log = -1.0
             if args.gradient_clipping!=-1: 
                 scaler.unscale_(optimizer)
+                # --- Monitor Unclipped Gradient ---
+                unclipped_norm = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        # Sum of squares of unscaled gradients
+                        unclipped_norm += p.grad.detach().data.norm(2).item() ** 2
+                
+                unclipped_norm_for_log = unclipped_norm ** 0.5
+
+                # Apply clipping to the raw gradients
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.gradient_clipping)
 
             scaler.step(optimizer)
             
-            # --- Monitor Gradient Stability ---
+            # --- Monitor Clipped Gradient ---
             grad_norm = 0.0
             for p in model.parameters():
                 if p.grad is not None:
-                        # Calculate norm safely
-                    param_norm = p.grad.detach().data.norm(2)
-                    grad_norm += param_norm.item() ** 2
+                    grad_norm += p.grad.detach().data.norm(2).item() ** 2
             grad_norm = grad_norm ** 0.5
-            # ----------------------------------
 
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
 
             # Conditional Tqdm Description
-            pbar_desc = f'Loss={loss.item():0.3f}. Acc(step)={accuracy_finegrained:0.3f}. Grad={grad_norm:.2f}. LR={current_lr:0.6f}.'
+            pbar_desc = f'Loss={loss.item():0.3f}. Acc(step)={accuracy_finegrained:0.3f}.'
+            
+            if args.gradient_clipping!=-1:
+                log_grad = f' Grad(U): {unclipped_norm_for_log:.2f} | Grad(C): {grad_norm:.2f}.'
+            else:
+                log_grad = f' Grad: {grad_norm:.2f}.'
+            
+            pbar_desc += log_grad + f' LR={current_lr:0.6f}.'
+
             if args.model in ['ctm', 'lstm'] or torch.is_tensor(where_most_certain): # Show stats if available
                  pbar_desc += f' Where_certain={where_most_certain_val:0.2f}+-{where_most_certain_std:0.2f} ({where_most_certain_min:d}<->{where_most_certain_max:d}).'
             if isinstance(upto_where, (np.ndarray, list)) and len(upto_where) > 0:
@@ -689,10 +705,6 @@ if __name__=='__main__':
                     figloss.savefig(f'{args.log_dir}/losses.png', dpi=150)
                     plt.close(figloss)
 
-                    if args.model == 'ctm':
-                        # This function uses the last synchronized state cached by the model during evaluation.
-                        visualize_evolution_metrics(model, save_path=f'{args.log_dir}/sw_evolution.png')
-
                     # --- Visualization Section (Conditional) ---
                     if args.model in ['ctm', 'lstm']:
                         #  try:
@@ -726,6 +738,7 @@ if __name__=='__main__':
                             # --- Small-World Health Check ---
                             if hasattr(model, 'out_neuron_indices_left'):
                                 visualize_small_world_diagnostics(model, synch_out_viz, f"{args.log_dir}/sw_diag", bi)
+                                visualize_evolution_metrics(model, synch_out_viz, f'{args.log_dir}/sw_evolution.png')
 
                                 decay = model.decay_params_out.detach().cpu().numpy() # Shape: (Neurons,)
                                 left = model.out_neuron_indices_left.detach().cpu().numpy()

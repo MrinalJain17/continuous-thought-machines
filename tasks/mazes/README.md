@@ -56,7 +56,7 @@ python -m tasks.mazes.train \
     --rewiring_prob 0.1 \
     --memory_length 25 \
     --memory_hidden_dims 256 \
-    --batch_size 16 \
+    --batch_size 32 \
     --training_iterations 100000 \
     --gradient_clipping 1.0 \
     --device 0 \
