@@ -540,9 +540,12 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         # Create source indices matching targets
         sources = hubs.unsqueeze(1).expand(-1, actual_k)
         
+        # DEBUG PRINT
+        print(f"DEBUG: Generating Small World. k={k}, p={p}")
         # Vectorized Rewiring
         # Generate random mask for rewiring (p)
         rand_mask = torch.rand(lattice_targets.shape, device=device) < p
+        print(f"DEBUG: Mask Mean (Rewired %): {rand_mask.float().mean().item():.4f}")
         
         # Generate random targets for where mask is True
         random_targets = torch.randint(0, d_model, lattice_targets.shape, device=device)
@@ -557,7 +560,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         final_targets = torch.where(rand_mask, random_targets, lattice_targets)
         
         # Define decay types: 1.0 for rewired (Global), 0.0 for lattice (Local)
-        neighbor_decay = torch.where(rand_mask, torch.tensor(1.0, device=device), torch.tensor(0.0, device=device))
+        neighbor_decay = torch.where(rand_mask, torch.tensor(1.0, device=device, dtype=torch.float32), torch.tensor(0.0, device=device, dtype=torch.float32))
 
         # Assembly
         # Flatten neighbor arrays
