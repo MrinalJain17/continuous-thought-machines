@@ -374,6 +374,13 @@ if __name__=='__main__':
             model.synapses = torch.compile(model.synapses, mode='reduce-overhead', fullgraph=True)
             model.trace_processor = torch.compile(model.trace_processor, mode='reduce-overhead', fullgraph=True)
 
+            # Warm up for eval loaders
+            model.eval()
+            inputs = torch.randn(args.batch_size_test, 3, 39, 39, device=device) 
+            with torch.inference_mode():
+                _ = model(inputs, track=True)
+            model.train()
+
     if args.model == 'ctm' and hasattr(model, 'out_neuron_indices_left'):
         visualize_topology_circle(
             model, 
@@ -730,6 +737,7 @@ if __name__=='__main__':
                     # --- End Visualization ---
 
                 model.train() # Switch back to train mode
+                torch.cuda.empty_cache()
 
 
             # Save model checkpoint
