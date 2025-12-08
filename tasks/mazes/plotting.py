@@ -219,8 +219,11 @@ def make_maze_gif(inputs, predictions, targets, attention_tracking, save_locatio
 def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_num):
     """
     Generates diagnostics for Small-World CTM.
-    1. Histogram: Log-scale to reveal 'Corridor Memory' population.
-    2. Heatmap: Sorted by decay to visualize functional hierarchy (Hubs -> Corridor -> Broadcast).
+    1. Histogram: Shows distribution of decay_param values (NOT decay rates r)
+    2. Heatmap: Sorted by decay_param to visualize functional hierarchy
+    
+    Note: decay_param and r are related by r = exp(-decay_param)
+    High decay_param → Low r → Long memory
     
     Args:
         model: CTM model (for indices/params)
@@ -236,63 +239,74 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     # =========================================================
     # PLOT 1: Topology Structure (Log-Scale Histogram)
     # =========================================================
-    plt.figure(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(10, 6))
     
-    # Plot Hubs (Blue) - usually a sharp peak at 0
-    sns.histplot(decay_params[is_hub], color="blue", label="Hubs (Memory)", kde=False, bins=60, alpha=0.6)
-    # Plot Lattice (Orange) - usually a bimodal distribution
-    ax = sns.histplot(decay_params[~is_hub], color="orange", label="Lattice (Broadcast)", kde=False, bins=60, alpha=0.6)
+    # Plot Hubs (Blue) - should peak near 15
+    sns.histplot(decay_params[is_hub], color="blue", label="Hubs (Self-Pairs)", 
+                 kde=False, bins=60, alpha=0.6, ax=ax)
+    # Plot Non-Hubs (Orange) - bimodal: lattice (~2.3) and rewired (~15)
+    sns.histplot(decay_params[~is_hub], color="orange", label="Connections", 
+                 kde=False, bins=60, alpha=0.6, ax=ax)
     
-    plt.yscale('log') # Log Scale to reveal the small "Corridor" bump between 0.1 and 0.5
-    plt.xlim(-0.05, 1.05)
-
+    ax.set_yscale('log')
+    ax.set_xlim(-0.5, 15.5)
+    
+    # Add reference lines and labels
     ylim = ax.get_ylim()
-    text_y = 10**(np.log10(ylim[1]) * 0.90)
-    ax.text(0.02, 0.95, "Infinite\n(Global)", transform=ax.transAxes, ha='left', va='top', color='blue', fontsize=9, fontweight='bold')
-    plt.text(0.1, text_y, "Corridor\n(~10 steps)", ha='center', va='bottom', color='gray', fontsize=9, fontweight='bold')
-    plt.text(1.0, text_y, "Instant\n(~1 step)", ha='center', va='bottom', color='gray', fontsize=9, fontweight='bold')
-
-    plt.vlines(x=[0.1, 1.0], ymin=ylim[0], ymax=ylim[1], colors='gray', linestyles='--', alpha=0.3)
-    plt.title(f"Topology Structure at Step {step_num}\n(Log Scale reveals the hidden 'Corridor Layer')")
-    plt.xlabel("Decay Rate")
-    plt.ylabel("Count (Log Scale)")
-    plt.legend(loc='upper right')
-    plt.grid(True, alpha=0.3, which="both")
+    text_y = 10**(np.log10(ylim[1]) * 0.85)
+    
+    # Label the three regions based on decay_param values
+    ax.axvline(x=0.5, color='gray', linestyle='--', alpha=0.3)
+    ax.axvline(x=2.3, color='gray', linestyle='--', alpha=0.3)
+    ax.axvline(x=10.0, color='gray', linestyle='--', alpha=0.3)
+    
+    ax.text(0.25, text_y, "Fast Decay\nr≈1\n(~1 step)", 
+            ha='center', va='bottom', color='gray', fontsize=9, fontweight='bold')
+    ax.text(1.4, text_y, "Working\nr≈0.1\n(~10 steps)", 
+            ha='center', va='bottom', color='gray', fontsize=9, fontweight='bold')
+    ax.text(12.5, text_y, "Infinite\nr≈0\n(Global)", 
+            ha='center', va='bottom', color='blue', fontsize=9, fontweight='bold')
+    
+    ax.set_title(f"Small-World Topology at Step {step_num}\n(Decay Parameter Distribution)")
+    ax.set_xlabel("Decay Parameter (higher → longer memory)")
+    ax.set_ylabel("Count (Log Scale)")
+    ax.legend(loc='upper left')
+    ax.grid(True, alpha=0.3, which="both")
+    
+    plt.tight_layout()
     plt.savefig(f"{save_prefix}_structure_{step_num}.png")
     plt.close()
 
     # =========================================================
     # PLOT 2: Neural Behavior (Sorted Heatmap)
     # =========================================================
-    # synch_out_viz shape: (Iterations, Batch, Pairs) -> Mean over Batch -> (Iterations, Pairs)
-    activity_avg = synch_out_viz.mean(axis=1) 
+    activity_avg = synch_out_viz.mean(axis=1)  # (Iterations, Pairs)
     
-    # Transpose to get (Pairs, Time) for heatmap
-    hubs_activity = activity_avg[:, is_hub].T 
+    # Separate hub and non-hub activity
+    hubs_activity = activity_avg[:, is_hub].T  # (num_hubs, Time)
+    nonhub_activity = activity_avg[:, ~is_hub].T  # (num_nonhubs, Time)
+    nonhub_decays = decay_params[~is_hub]
     
-    # B. Extract Lattice Data & Decay Values
-    lattice_activity = activity_avg[:, ~is_hub].T
-    lattice_decays = decay_params[~is_hub]
+    # Sort non-hubs by decay_param (low to high)
+    sort_indices = np.argsort(nonhub_decays)
+    nonhub_activity_sorted = nonhub_activity[sort_indices, :]
     
-    # This groups 'Corridor Neurons' (Low Decay) at the top, 'Broadcast Neurons' (High Decay) at bottom
-    sort_indices = np.argsort(lattice_decays)
-    lattice_activity_sorted = lattice_activity[sort_indices, :]
-    
-    # D. Downsample Lattice to match Hub height (for clean side-by-side plotting)
-    # We take a uniform linspace so we see samples from the whole spectrum (Corridor -> Broadcast)
-    if lattice_activity_sorted.shape[0] > hubs_activity.shape[0]:
-        indices = np.linspace(0, lattice_activity_sorted.shape[0]-1, hubs_activity.shape[0], dtype=int)
-        lattice_activity_sorted = lattice_activity_sorted[indices, :]
+    # Downsample if needed for visualization
+    if nonhub_activity_sorted.shape[0] > hubs_activity.shape[0]:
+        indices = np.linspace(0, nonhub_activity_sorted.shape[0]-1, 
+                             hubs_activity.shape[0], dtype=int)
+        nonhub_activity_sorted = nonhub_activity_sorted[indices, :]
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
     
     sns.heatmap(hubs_activity, ax=ax1, cmap="magma", cbar=True, vmin=0, vmax=2.0)
-    ax1.set_title("Tier 1: Hub Activity (Infinite Global Memory)")
+    ax1.set_title("Hub Activity (Self-Pairs, Infinite Memory)")
     ax1.set_ylabel("Hub Neurons")
     
-    sns.heatmap(lattice_activity_sorted, ax=ax2, cmap="viridis", cbar=True, vmin=0, vmax=2.0)
-    ax2.set_title("Tier 2 & 3: Lattice Activity (Sorted by Decay)\n(Top = Corridor Memory, Bottom = Instant Broadcast)")
-    ax2.set_ylabel("Lattice Connections\n(Low Decay $\\to$ High Decay)")
+    sns.heatmap(nonhub_activity_sorted, ax=ax2, cmap="viridis", cbar=True, vmin=0, vmax=2.0)
+    ax2.set_title("Connection Activity (Sorted by Decay Parameter)\n" + 
+                 "(Bottom = Fast Decay, Middle = Working Memory, Top = Infinite)")
+    ax2.set_ylabel("Connections\n(Low decay_param → High decay_param)")
     ax2.set_xlabel("Time Steps")
     
     plt.tight_layout()
@@ -303,71 +317,74 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
 def visualize_topology_circle(model, save_path="sw_topology.png"):
     """
     Visualizes the Small-World connectivity of the CTM.
-    Plots a subset of Hubs in a ring to highlight the 'Lattice' vs 'Rewired' structure.
+    Shows hub structure and connection types based on decay_param values.
+    
+    Color coding:
+    - Blue: Infinite memory (decay_param > 10, includes hubs and rewired)
+    - Green: Working memory (1 < decay_param < 10, lattice connections)
+    - Red: Fast decay (decay_param < 1, noise/remainder)
     """
     left = model.out_neuron_indices_left.cpu().numpy()
     right = model.out_neuron_indices_right.cpu().numpy()
     decay_params = model.decay_params_out.cpu().detach().numpy()
     
-    # Filter for Clarity (Plot Top 32 Hubs Only)
+    # Select subset of hubs for visualization clarity
     unique_hubs = np.unique(left)
-    selected_hubs = unique_hubs[:32] 
+    selected_hubs = unique_hubs[:32]
     
-    # Filter edges originating from these hubs
+    # Filter edges from selected hubs
     mask = np.isin(left, selected_hubs)
     sources = left[mask]
     targets = right[mask]
+    edge_decay_params = decay_params[mask]
     
-    # Get the functional decay value for the filtered edges
-    edge_decay_values = decay_params[mask]
-    
-    # Build Graph
+    # Build graph with color-coded edges
     G = nx.DiGraph()
     active_nodes = np.unique(np.concatenate([sources, targets]))
-
-    all_edges = []
-    for i, (s, t) in enumerate(zip(sources, targets)):
-        decay_value = edge_decay_values[i]
-        if s == t:  # TIER 1 Self-loops (param ~ 0.0)
-            all_edges.append((s, t, {'color': 'blue'}))
-        elif decay_value > 2.0:  # TIER 2: Chain/Lattice (param ~ 2.302)
-            all_edges.append((s, t, {'color': 'green'}))
-        elif decay_value < 0.01:  # TIER 3: Scout/Rewired (param ~ 0.0)
-            all_edges.append((s, t, {'color': 'blue'}))
-        else:  # Catch noisy remainders
-            all_edges.append((s, t, {'color': 'red'}))
-
-    G.add_edges_from(all_edges)
-
-    # Draw
+    
+    for s, t, decay_param in zip(sources, targets, edge_decay_params):
+        if decay_param > 10.0:
+            # High decay_param → r≈0 → Infinite memory (hubs and rewired)
+            color = 'blue'
+            label = 'Infinite'
+        elif decay_param > 1.0:
+            # Medium decay_param → r≈0.1-0.4 → Working memory (lattice)
+            color = 'green'
+            label = 'Working'
+        else:
+            # Low decay_param → r≈1 → Fast decay (noise/remainder)
+            color = 'red'
+            label = 'Fast'
+        
+        G.add_edge(s, t, color=color, label=label)
+    
+    # Circular layout
     plt.figure(figsize=(10, 10))
-    # Circular Layout based on Neuron Index
-    pos = {n: (np.cos(2*np.pi*n/model.d_model), np.sin(2*np.pi*n/model.d_model)) for n in active_nodes}
-
-    edgelist, edge_color = [], []
-    for (u, v, d) in G.edges(data=True):
-        edgelist.append((u, v))
-        edge_color.append(d['color'])
+    pos = {n: (np.cos(2*np.pi*n/model.d_model), 
+               np.sin(2*np.pi*n/model.d_model)) 
+           for n in active_nodes}
+    
+    # Draw nodes
     nx.draw_networkx_nodes(G, pos, node_size=20, node_color='black')
-    nx.draw_networkx_edges(
-        G,
-        pos,
-        edgelist=edgelist,
-        edge_color=edge_color,
-        alpha=0.5,
-        arrows=True,
-        width=1.0
-    )
-
+    
+    # Draw edges by type
+    edge_colors = [G[u][v]['color'] for u, v in G.edges()]
+    nx.draw_networkx_edges(G, pos, edgelist=list(G.edges()),
+                          edge_color=edge_colors, alpha=0.5, 
+                          arrows=True, width=1.0)
+    
     # Legend
     legend_elements = [
-        Line2D([0], [0], color='blue', lw=2, label='Anchor/Scout'),
-        Line2D([0], [0], color='green', lw=2, label='Chain (Lattice)'),
-        Line2D([0], [0], color='red', lw=2, label='Remainder/Noise')
+        Line2D([0], [0], color='blue', lw=2, 
+               label='Infinite Memory (decay_param > 10)'),
+        Line2D([0], [0], color='green', lw=2, 
+               label='Working Memory (1 < decay_param < 10)'),
+        Line2D([0], [0], color='red', lw=2, 
+               label='Fast Decay (decay_param < 1)')
     ]
     plt.legend(handles=legend_elements, loc='upper right')
     
-    plt.title(f"Small-World Topology Snapshot\n(Showing {len(selected_hubs)} Hubs)")
+    plt.title(f"Small-World Topology\n(Showing {len(selected_hubs)} hubs)")
     plt.axis('off')
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)

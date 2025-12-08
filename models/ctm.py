@@ -588,26 +588,25 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             all_left = torch.cat([all_left, fill_left])
             all_right = torch.cat([all_right, fill_right])
             all_decay_types = torch.cat([all_decay_types, fill_decay])
+        
+        TARGET_R_INFINITE = 0.0  # For hubs and rewired shortcuts
+        TARGET_R_WORKING = 0.1   # For lattice connections
 
-        # Map types to initialization values
-        # 1.0 (Rewired Type) -> 1.0 (Transient/Coincidence Detection)
-        # 0.0 (Lattice Type) -> 0.1 (Working Memory)
-        # Map types to the CORRECT NEGATIVE LOG parameter values (param = -ln(r_desired)).
-        LOG_10 = 0.0 # -ln(1.0) = 0.0 (Target for Rewired)
-        LOG_01 = 2.302585 # -ln(0.1) ~ 2.302 (Target for Lattice)
+        # Convert to decay_param (param = -ln(r), but handle r=0 specially)
+        PARAM_INFINITE = 15.0  # Max value, gives r ≈ 3e-7 ≈ 0
+        PARAM_WORKING = -np.log(TARGET_R_WORKING)  # ≈ 2.302
+
         decay_init = torch.where(
             all_decay_types > 0.5,
-            torch.tensor(LOG_10, device=device),  # Rewired (intended r=1.0) -> param=0.0
-            torch.tensor(LOG_01, device=device)   # Lattice (intended r=0.1) -> param=2.302
+            torch.tensor(PARAM_INFINITE, device=device),  # Rewired
+            torch.tensor(PARAM_WORKING, device=device)    # Lattice
         )
 
         # Add noise to allow learning diversity
         decay_init += torch.randn_like(decay_init) * 0.01
-        
-        # CRITICAL OPTIMIZATION: Force Self-Pairs to 0.0 (Infinite Memory)
-        # Self-pairs are the first 'num_hubs' indices. We overwrite them AFTER noise 
-        # to ensure they provide a stable "Energy" signal for normalization.
-        decay_init[:num_hubs] = 0.0
+
+        # Ensure self-pairs have infinite memory
+        decay_init[:num_hubs] = PARAM_INFINITE
         
         return all_left, all_right, decay_init
 

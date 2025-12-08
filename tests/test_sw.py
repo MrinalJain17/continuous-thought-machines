@@ -146,9 +146,8 @@ def test_decay_initialization_priors(ctm_factory, base_params, device):
     self_mask = (left == right)
     self_decays = decay_params[self_mask]
     
-    # Should be exactly 0.0 (before noise addition) or very close to 0
-    # Our code overrides self-pairs to 0.0 *after* noise, so it should be exact.
-    assert torch.all(self_decays == 0.0), "Self-pairs must have 0.0 decay (Infinite Memory)"
+    # Self-pairs should have high decay_param (≈15)
+    assert torch.all(self_decays > 14.0), "Self-pairs need large decay_param for infinite memory"
     
     # 2. Verify Others (Lattice vs Rewired)
     other_mask = ~self_mask
@@ -156,12 +155,12 @@ def test_decay_initialization_priors(ctm_factory, base_params, device):
     
     # We simply check that we have a bimodal distribution
     # Lattice (r=0.1) requires param ~ 2.30
-    # Rewired (r=1.0) requires param ~ 0.0
+    # Rewired (r=1.0) requires param ~ inf/large
     # Note: Noise is +/- 0.01
     
     has_lattice = torch.any((other_decays > 2.25) & (other_decays < 2.35))
-    has_rewired = torch.any((other_decays > -0.05) & (other_decays < 0.05))
-    
+    has_rewired = torch.any((other_decays > 14.0))  # Not 0!
+
     assert has_lattice, "Missing Lattice (Local) decay priors (~0.1)"
     assert has_rewired, "Missing Rewired (Global) decay priors (~1.0)"
 
