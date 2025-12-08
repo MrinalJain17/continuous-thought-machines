@@ -494,21 +494,23 @@ if __name__=='__main__':
             scheduler.step()
 
             # Conditional Tqdm Description
-            pbar_desc = f'Loss={loss.item():0.3f}. Acc(step)={accuracy_finegrained:0.3f}.'
+            pbar_desc = f'L={loss.item():0.3f} Acc={accuracy_finegrained:0.3f}'
             
             if args.gradient_clipping!=-1:
-                log_grad = f' Grad(U): {unclipped_norm_for_log:.2f} | Grad(C): {grad_norm:.2f}.'
+                log_grad = f' GU:{unclipped_norm_for_log:.2f} GC:{grad_norm:.2f}'
             else:
-                log_grad = f' Grad: {grad_norm:.2f}.'
+                log_grad = f' G:{grad_norm:.2f}'
             
-            pbar_desc += log_grad + f' LR={current_lr:0.6f}.'
+            pbar_desc += log_grad + f' LR={current_lr:0.6f}'
 
             if args.model in ['ctm', 'lstm'] or torch.is_tensor(where_most_certain): # Show stats if available
-                 pbar_desc += f' Where_certain={where_most_certain_val:0.2f}+-{where_most_certain_std:0.2f} ({where_most_certain_min:d}<->{where_most_certain_max:d}).'
+                 # T=Tick Time. Formatted as: T: µ=Mean ±Std [Min-Max]
+                 pbar_desc += f' | T: µ{where_most_certain_val:0.1f}±{where_most_certain_std:0.1f} [{where_most_certain_min:d}-{where_most_certain_max:d}]'
             if isinstance(upto_where, (np.ndarray, list)) and len(upto_where) > 0:
-                 pbar_desc += f' Path pred stats: {upto_where_mean:0.2f}+-{upto_where_std:0.2f} ({upto_where_min:d} --> {upto_where_max:d})'
+                 # L=Path Length. Formatted as: L: µ=Mean ±Std [Min-Max]
+                 pbar_desc += f' | L: µ{upto_where_mean:0.1f}±{upto_where_std:0.1f} [{upto_where_min:d}-{upto_where_max:d}]'
 
-            pbar.set_description(f'Dataset={args.dataset}. Model={args.model}. {pbar_desc}')
+            pbar.set_description(pbar_desc)
 
 
             # Metrics tracking and plotting
