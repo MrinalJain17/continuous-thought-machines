@@ -745,7 +745,7 @@ if __name__=='__main__':
                                 decay = model.decay_params_out.detach().cpu().numpy() # Shape: (Neurons,)
                                 left = model.out_neuron_indices_left.detach().cpu().numpy()
                                 right = model.out_neuron_indices_right.detach().cpu().numpy()
-                                activity_np = synch_out_viz.detach().cpu().numpy()
+                                activity_np = synch_out_viz
                                 
                                 self_loop_edge_mask = (left == right)
                                 if self_loop_edge_mask.any():
