@@ -16,7 +16,7 @@ from data.custom_datasets import MazeImageFolder
 from models.ctm import ContinuousThoughtMachine
 from models.lstm import LSTMBaseline
 from models.ff import FFBaseline
-from tasks.mazes.plotting import make_maze_gif, visualize_small_world_diagnostics, visualize_topology_matrix, export_to_gephi, export_full_network
+from tasks.mazes.plotting import make_maze_gif, visualize_small_world_diagnostics, visualize_topology_matrix, export_to_gephi, export_full_network, visualize_evolution_metrics
 from tasks.image_classification.plotting import plot_neural_dynamics 
 from utils.housekeeping import set_seed, zip_python_code
 from utils.losses import maze_loss 
@@ -470,12 +470,23 @@ if __name__=='__main__':
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.gradient_clipping)
 
             scaler.step(optimizer)
+            
+            # --- Monitor Gradient Stability ---
+            grad_norm = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                        # Calculate norm safely
+                    param_norm = p.grad.detach().data.norm(2)
+                    grad_norm += param_norm.item() ** 2
+            grad_norm = grad_norm ** 0.5
+            # ----------------------------------
+
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
 
             # Conditional Tqdm Description
-            pbar_desc = f'Loss={loss.item():0.3f}. Acc(step)={accuracy_finegrained:0.3f}. LR={current_lr:0.6f}.'
+            pbar_desc = f'Loss={loss.item():0.3f}. Acc(step)={accuracy_finegrained:0.3f}. Grad={grad_norm:.2f}. LR={current_lr:0.6f}.'
             if args.model in ['ctm', 'lstm'] or torch.is_tensor(where_most_certain): # Show stats if available
                  pbar_desc += f' Where_certain={where_most_certain_val:0.2f}+-{where_most_certain_std:0.2f} ({where_most_certain_min:d}<->{where_most_certain_max:d}).'
             if isinstance(upto_where, (np.ndarray, list)) and len(upto_where) > 0:
@@ -678,6 +689,10 @@ if __name__=='__main__':
                     figloss.savefig(f'{args.log_dir}/losses.png', dpi=150)
                     plt.close(figloss)
 
+                    if args.model == 'ctm':
+                        # This function uses the last synchronized state cached by the model during evaluation.
+                        visualize_evolution_metrics(model, save_path=f'{args.log_dir}/sw_evolution.png')
+
                     # --- Visualization Section (Conditional) ---
                     if args.model in ['ctm', 'lstm']:
                         #  try:
@@ -712,21 +727,56 @@ if __name__=='__main__':
                             if hasattr(model, 'out_neuron_indices_left'):
                                 visualize_small_world_diagnostics(model, synch_out_viz, f"{args.log_dir}/sw_diag", bi)
 
-                                decay = model.decay_params_out
-                                is_self = (model.out_neuron_indices_left == model.out_neuron_indices_right)
-                                log_msg = f"[Iter {bi}]"
+                                decay = model.decay_params_out.detach().cpu().numpy() # Shape: (Neurons,)
+                                left = model.out_neuron_indices_left.detach().cpu().numpy()
+                                right = model.out_neuron_indices_right.detach().cpu().numpy()
+                                activity_np = synch_out_viz.detach().cpu().numpy()
                                 
-                                if is_self.any():
-                                    # synch_out_viz is (Time, Batch, Pairs) numpy array
-                                    # We average over Time and Batch
-                                    hub_energy = synch_out_viz[:, :, is_self.cpu().numpy()].mean()
-                                    self_decay = decay[is_self].mean().item()
-                                    other_decay = decay[~is_self].mean().item()
-                                    log_msg += f" Hub Energy: {hub_energy:.5f} | Decay: Self={self_decay:.3f} / Other={other_decay:.3f}"
+                                self_loop_edge_mask = (left == right)
+                                if self_loop_edge_mask.any():
+                                    hub_neuron_ids = left[self_loop_edge_mask]
+                                    raw_activity = activity_np[:, :, hub_neuron_ids] # -> (Batch, Time, Num_Hubs)
+                                    label = "Hub"
+                                    
+                                    # Calculate Decay Rates (Hubs vs Others)
+                                    self_decay = decay[hub_neuron_ids].mean()
+                                    
+                                    # Create mask for "Other" neurons
+                                    all_indices = np.arange(len(decay))
+                                    other_mask = ~np.isin(all_indices, hub_neuron_ids)
+                                    other_decay = decay[other_mask].mean()
+                                    decay_str = f"| Decay: Self={self_decay:.3f} / Other={other_decay:.3f}"
+                                    
                                 else:
-                                    log_msg += f" Mean Synch: {synch_out_viz.mean():.5f}"
-                                tqdm.write(log_msg)
+                                    raw_activity = activity_np
+                                    label = "Global"
+                                    decay_str = ""
 
+                                # --- VITAL SIGN 1: ENERGY & DEATH ---
+                                # Average over Batch (0) and Time (1) to get per-neuron stats
+                                mean_neuron_activity = np.abs(raw_activity).mean(axis=(0, 1)) # (Hubs,)
+                                hub_energy = mean_neuron_activity.mean()
+                                dead_pct = (mean_neuron_activity < 1e-6).mean() * 100
+
+                                # --- VITAL SIGN 2: EFFECTIVE RANK ---
+                                # Goal: Check if the BATCH items are distinct.
+                                # We collapse TIME (axis 1), preserving BATCH (axis 0)
+                                # Result: (Batch, Hubs) - "What was the average thought of this hub for this image?"
+                                batch_activity = np.abs(raw_activity).mean(axis=1) 
+                                
+                                try:
+                                    # SVD on (Batch, Features)
+                                    _, S, _ = np.linalg.svd(batch_activity)
+                                    sing_vals = S / (S.sum() + 1e-9)
+                                    effective_rank = np.exp(-np.sum(sing_vals * np.log(sing_vals + 1e-9)))
+                                except:
+                                    effective_rank = 0.0
+
+                                tqdm.write(
+                                    f"[Iter {bi}] {label} Energy: {hub_energy:.4f} | "
+                                    f"Dead: {dead_pct:.1f}% | "
+                                    f"Rank: {effective_rank:.1f} {decay_str}"
+                                )
                         #  except Exception as e:
                         #       print(f"Visualization failed for model {args.model}: {e}")
                     # --- End Visualization ---

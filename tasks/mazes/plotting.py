@@ -319,6 +319,89 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     plt.close()
 
 
+def visualize_evolution_metrics(model, save_path="sw_evolution.png"):
+    activity = model.last_synch_out.detach().cpu()
+    
+    # 1. Hub Extraction (Safe Mode)
+    left = model.out_neuron_indices_left.detach().cpu().numpy()
+    right = model.out_neuron_indices_right.detach().cpu().numpy()
+    self_loop_edge_mask = (left == right)
+    
+    # Calculate global mean activity over Batch and Time (Shape: [Neurons])
+    global_mean_activity = activity.abs().mean(dim=(0, 1)).numpy() 
+    # Use a flag to track if we found hubs or fell back to global
+    hubs_only_flag = False 
+    if self_loop_edge_mask.any():
+        # Get the actual Neuron IDs that are hubs
+        hub_neuron_ids = left[self_loop_edge_mask]
+        # Slice the global_mean_activity vector using the correct IDs
+        hubs_only = global_mean_activity[hub_neuron_ids]
+        hubs_only_flag = True
+    else:
+        # Fallback: If no self-loops, treat top 10% most active neurons as "functional hubs"
+        threshold = np.percentile(global_mean_activity, 90)
+        hubs_only = global_mean_activity[global_mean_activity > threshold]
+
+    # 2. Vital Signs
+    dead_hub_rate = (hubs_only < 1e-6).sum() / (len(hubs_only) + 1e-9)
+    global_energy = global_mean_activity.sum() # Global energy across all neurons
+
+    # 3. Distribution Metrics
+    # ---------------------------------------------------------
+    # Gini (Inequality)
+    sorted_hubs = np.sort(hubs_only)
+    n = len(hubs_only)
+    index = np.arange(1, n + 1)
+    # Add epsilon to divisor to prevent div/0
+    gini = ((2 * index - n - 1) * sorted_hubs).sum() / (n * sorted_hubs.sum() + 1e-9)
+
+    # Entropy (Sharpness)
+    p = hubs_only / (hubs_only.sum() + 1e-9)
+    entropy = -np.sum(p * np.log(p + 1e-9))
+
+    # Effective Rank (Diversity)
+    # We measure the SVD of the activity, averaged over time (axis 1)
+    batch_activity = activity.abs().mean(dim=1).numpy()
+    try:
+        _, S, _ = np.linalg.svd(batch_activity)
+        singular_vals = S / S.sum()
+        effective_rank = np.exp(-np.sum(singular_vals * np.log(singular_vals + 1e-9)))
+    except:
+        effective_rank = 0.0 # Handle singular matrix crash
+
+    # 4. Visualization
+    fig, ax = plt.subplots(1, 4, figsize=(20, 5))
+
+    # Plot A: Lorenz Curve
+    lorenz_curve = np.cumsum(sorted_hubs) / (sorted_hubs.sum() + 1e-9)
+    ax[0].plot(np.linspace(0, 1, n), lorenz_curve, color='purple', lw=2)
+    ax[0].plot([0, 1], [0, 1], 'k--', alpha=0.3)
+    title_label = "Hub" if hubs_only_flag else "Functional"
+    ax[0].set_title(f"{title_label} Inequality (Gini: {gini:.2f})\nHigh = Winner-Take-All")
+
+    # Plot B: Activity Dist (Entropy)
+    sns.histplot(hubs_only, bins=20, ax=ax[1], color='orange', kde=True)
+    ax[1].set_title(f"{title_label} Load (Entropy: {entropy:.2f})\nDead Hubs: {dead_hub_rate*100:.1f}%")
+    ax[1].set_xlabel("Activity Magnitude")
+
+    # Plot C: Dimensionality (Rank)
+    ax[2].plot(singular_vals[:min(50, len(singular_vals))], marker='o', markersize=3, color='green')
+    ax[2].set_title(f"Feature Diversity\nRank: {effective_rank:.1f}/{min(activity.shape[0], activity.shape[2])}")
+    ax[2].set_ylabel("Singular Val Strength")
+
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
+    return {
+        "gini": gini, 
+        "entropy": entropy, 
+        "rank": effective_rank, 
+        "dead_hubs": dead_hub_rate,
+        "energy": global_energy
+    }
+
+
 def visualize_topology_matrix(model, save_path="sw_matrix.png"):
     """
     Visualizes the Small-World connectivity as an Adjacency Matrix Scatter Plot.

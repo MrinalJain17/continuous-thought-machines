@@ -39,22 +39,24 @@ python -m tasks.mazes.train \
 Exp (Small World):
 ```
 python -m tasks.mazes.train \
-    --model ctm \
     --dataset mazes-medium \
     --log_dir logs/small_world_optimized \
-    --d_model 2048 \
+    --model ctm \
+    --d_model 1024 \
+    --dropout 0.0 \
+    --backbone_type shallow-wide \
     --d_input 512 \
-    --heads 16 \
-    --n_synch_out 4160 \
-    --n_synch_action 4160 \
+    --heads 8 \
+    --iterations 75 \
+    --synapse_depth 8 \
+    --n_synch_out 2112 \
+    --n_synch_action 2112 \
     --neuron_select_type small-world \
-    --connectivity 31 \
-    --rewiring_prob 0.2 \
-    --synapse_depth 4 \
-    --dropout 0.15 \
-    --memory_length 10 \
+    --connectivity 32 \
+    --rewiring_prob 0.1 \
+    --memory_length 25 \
     --memory_hidden_dims 256 \
-    --batch_size 64 \
+    --batch_size 16 \
     --training_iterations 100000 \
     --gradient_clipping 1.0 \
     --device 0 \
