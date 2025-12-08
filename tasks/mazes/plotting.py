@@ -325,39 +325,39 @@ def visualize_topology_circle(model, save_path="sw_topology.png"):
     G = nx.DiGraph()
     active_nodes = np.unique(np.concatenate([sources, targets]))
 
-    self_loops = []
-    non_self_loops = []
-    non_self_decay_values = []
+    all_edges = []
     for i, (s, t) in enumerate(zip(sources, targets)):
-        decay_value = edge_decay_values[i] 
-        if s == t:
-            self_loops.append((s, t))
-        else:
-            non_self_loops.append((s, t))
-            non_self_decay_values.append(decay_value)
+        decay_value = edge_decay_values[i]
+        if s == t:  # TIER 1 Self-loops (param ~ 0.0)
+            all_edges.append((s, t, {'color': 'blue'}))
+        elif decay_value > 2.0:  # TIER 2: Chain/Lattice (param ~ 2.302)
+            all_edges.append((s, t, {'color': 'green'}))
+        elif decay_value < 0.01:  # TIER 3: Scout/Rewired (param ~ 0.0)
+            all_edges.append((s, t, {'color': 'blue'}))
+        else:  # Catch noisy remainders
+            all_edges.append((s, t, {'color': 'red'}))
 
-    edge_colors = []
-    for _ in self_loops:
-        edge_colors.append('blue')
-
-    for decay_value in non_self_decay_values:
-        if decay_value > 2.0: 
-            edge_colors.append('green')  # TIER 2: Chain/Lattice (param ~ 2.302)
-        elif decay_value < 0.01:
-            edge_colors.append('blue')  # TIER 3: Scout/Rewired (param ~ 0.0)
-        else:
-            edge_colors.append('red')  # Catch noisy remainders
-
-    all_edges = self_loops + non_self_loops
     G.add_edges_from(all_edges)
 
     # Draw
     plt.figure(figsize=(10, 10))
     # Circular Layout based on Neuron Index
     pos = {n: (np.cos(2*np.pi*n/model.d_model), np.sin(2*np.pi*n/model.d_model)) for n in active_nodes}
-    
+
+    edgelist, edge_color = [], []
+    for (u, v, d) in G.edges(data=True):
+        edgelist.append((u, v))
+        edge_color.append(d['color'])
     nx.draw_networkx_nodes(G, pos, node_size=20, node_color='black')
-    nx.draw_networkx_edges(G, pos, edgelist=all_edges, edge_color=edge_colors, alpha=0.5, arrows=True, width=1.0)
+    nx.draw_networkx_edges(
+        G,
+        pos,
+        edgelist=edgelist,
+        edge_color=edge_color,
+        alpha=0.5,
+        arrows=True,
+        width=1.0
+    )
 
     # Legend
     legend_elements = [
