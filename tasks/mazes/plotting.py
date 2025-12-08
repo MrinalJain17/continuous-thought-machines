@@ -325,24 +325,31 @@ def visualize_topology_circle(model, save_path="sw_topology.png"):
     G = nx.DiGraph()
     active_nodes = np.unique(np.concatenate([sources, targets]))
 
-    # We use strict thresholds based on the fixed initialization values:
-    # Tiers 1 and 3 are initialized near 0.0 (Infinite/Transient)
-    # Tier 2 is initialized near 2.302 (Working Memory)
-    edge_colors = []
+    self_loops = []
+    non_self_loops = []
+    non_self_decay_values = []
     for i, (s, t) in enumerate(zip(sources, targets)):
-        G.add_edge(s, t)
-        decay_value = edge_decay_values[i]
-
-        if s == t or decay_value < 0.01:
-            # Tiers 1 & 3: Anchor (Self-Loop) / Scout (Rewired) 
-            # Both are param ~ 0.0, indicating the highest possible retention (r=1.0).
-            edge_colors.append('blue') 
-        elif decay_value > 2.0: 
-            # Tier 2: Chain/Lattice (param ~ 2.302)
-            edge_colors.append('green') 
+        decay_value = edge_decay_values[i] 
+        if s == t:
+            self_loops.append((s, t))
         else:
-            # Catch noisy remainders (use red for consistency)
-            edge_colors.append('red') 
+            non_self_loops.append((s, t))
+            non_self_decay_values.append(decay_value)
+
+    edge_colors = []
+    for _ in self_loops:
+        edge_colors.append('blue')
+
+    for decay_value in non_self_decay_values:
+        if decay_value > 2.0: 
+            edge_colors.append('green')  # TIER 2: Chain/Lattice (param ~ 2.302)
+        elif decay_value < 0.01:
+            edge_colors.append('blue')  # TIER 3: Scout/Rewired (param ~ 0.0)
+        else:
+            edge_colors.append('red')  # Catch noisy remainders
+
+    all_edges = self_loops + non_self_loops
+    G.add_edges_from(all_edges)
 
     # Draw
     plt.figure(figsize=(10, 10))
@@ -350,8 +357,8 @@ def visualize_topology_circle(model, save_path="sw_topology.png"):
     pos = {n: (np.cos(2*np.pi*n/model.d_model), np.sin(2*np.pi*n/model.d_model)) for n in active_nodes}
     
     nx.draw_networkx_nodes(G, pos, node_size=20, node_color='black')
-    nx.draw_networkx_edges(G, pos, edge_color=edge_colors, alpha=0.5, arrows=True, width=1.0)
-    
+    nx.draw_networkx_edges(G, pos, edgelist=all_edges, edge_color=edge_colors, alpha=0.5, arrows=True, width=1.0)
+
     # Legend
     legend_elements = [
         Line2D([0], [0], color='blue', lw=2, label='Anchor/Scout'),
