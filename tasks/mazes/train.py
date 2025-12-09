@@ -16,7 +16,7 @@ from data.custom_datasets import MazeImageFolder
 from models.ctm import ContinuousThoughtMachine
 from models.lstm import LSTMBaseline
 from models.ff import FFBaseline
-from tasks.mazes.plotting import make_maze_gif, visualize_small_world_diagnostics, visualize_topology_matrix, export_to_gephi, export_full_network, visualize_evolution_metrics
+from tasks.mazes.plotting import make_maze_gif, visualize_small_world_diagnostics, visualize_topology_matrix, export_full_network, visualize_evolution_metrics
 from tasks.image_classification.plotting import plot_neural_dynamics 
 from utils.housekeeping import set_seed, zip_python_code
 from utils.losses import maze_loss 
@@ -289,7 +289,7 @@ if __name__=='__main__':
         param_groups.append({'params': no_decay_params, 'weight_decay': 0.0})
         
     if len(special_lr_params) > 0:
-        param_groups.append({'params': special_lr_params, 'weight_decay': 0.0, 'lr': args.lr})
+        param_groups.append({'params': special_lr_params, 'weight_decay': 0.0, 'lr': args.lr * 10})
 
     optimizer = torch.optim.AdamW(
         param_groups,
@@ -375,7 +375,6 @@ if __name__=='__main__':
             model.trace_processor = torch.compile(model.trace_processor, mode='reduce-overhead', fullgraph=True)
 
     if args.model == 'ctm' and hasattr(model, 'out_neuron_indices_left'):
-        export_to_gephi(model, save_path=f"{args.log_dir}/sw_network.graphml")
         export_full_network(model, save_path=f"{args.log_dir}/sw_full_network.graphml")
         visualize_topology_matrix(
             model, 
@@ -739,10 +738,10 @@ if __name__=='__main__':
 
                             # --- Small-World Health Check ---
                             if hasattr(model, 'out_neuron_indices_left'):
-                                visualize_small_world_diagnostics(model, synch_out_viz, f"{args.log_dir}/sw_diag", bi)
+                                visualize_small_world_diagnostics(model, synch_out_viz, f"{args.log_dir}/sw_diagnostics/sw_", bi)
                                 visualize_evolution_metrics(model, synch_out_viz, f'{args.log_dir}/sw_evolution.png')
 
-                                decay = model.decay_params_out.detach().cpu().numpy() # Shape: (Neurons,)
+                                decay = np.exp(-model.decay_params_out.detach().cpu().numpy())
                                 left = model.out_neuron_indices_left.detach().cpu().numpy()
                                 right = model.out_neuron_indices_right.detach().cpu().numpy()
                                 activity_np = synch_out_viz

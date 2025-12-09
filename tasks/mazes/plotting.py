@@ -221,15 +221,11 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     Generates diagnostics for Small-World CTM.
     1. Histogram: Shows distribution of decay_param values (NOT decay rates r)
     2. Heatmap: Sorted by decay_param to visualize functional hierarchy
-    
-    Note: decay_param and r are related by r = exp(-decay_param)
-    High decay_param → Low r → Long memory
-    
-    Args:
-        model: CTM model (for indices/params)
-        synch_out_viz: NumPy array (Iterations, Batch, Pairs) from the test batch
-        save_prefix: Path prefix
-        step_num: Iteration number
+
+    r = exp(-decay_param)
+    - param ≈ 0.0  → r ≈ 1.0 (Infinite Memory / Hubs)
+    - param ≈ 0.1  → r ≈ 0.9 (Working Memory / Lattice)
+    - param ≈ 15.0 → r ≈ 0.0 (Zero Memory / Rewired)
     """
     decay_params = model.decay_params_out.detach().cpu().numpy()
     left = model.out_neuron_indices_left.cpu().numpy()
@@ -241,36 +237,40 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     # =========================================================
     fig, ax = plt.subplots(figsize=(10, 6))
     
-    # Plot Hubs (Blue) - should peak near 15
+    # Plot Hubs (Blue) - should peak near 0.0 (Infinite Memory)
     sns.histplot(decay_params[is_hub], color="blue", label="Hubs (Self-Pairs)", 
                  kde=False, bins=60, alpha=0.6, ax=ax)
-    # Plot Non-Hubs (Orange) - bimodal: lattice (~2.3) and rewired (~15)
+    
+    # Plot Non-Hubs (Orange) - bimodal: Lattice (~0.1) and Rewired (~15.0)
     sns.histplot(decay_params[~is_hub], color="orange", label="Connections", 
                  kde=False, bins=60, alpha=0.6, ax=ax)
     
     ax.set_yscale('log')
-    ax.set_xlim(-0.5, 15.5)
+    ax.set_xlim(-0.5, 16.5)
     
     # Reference Lines & Labels
     ylim = ax.get_ylim()
     text_y = 10**(np.log10(ylim[1]) * 0.85)
     
-    # Label the three regions based on decay_param values
-    ax.axvline(x=0.5, color='gray', linestyle='--', alpha=0.3)
-    ax.axvline(x=2.3, color='gray', linestyle='--', alpha=0.3)
-    ax.axvline(x=10.0, color='gray', linestyle='--', alpha=0.3)
-    
-    ax.text(0.25, text_y, "Fast Decay\nr≈1\n(Noise)", 
-            ha='center', va='bottom', color='gray', fontsize=9, fontweight='bold')
-    ax.text(1.4, text_y, "Working\nr≈0.1\n(Lattice)", 
-            ha='center', va='bottom', color='gray', fontsize=9, fontweight='bold')
-    ax.text(12.5, text_y, "Infinite\nr≈0\n(Global)", 
-            ha='center', va='bottom', color='blue', fontsize=9, fontweight='bold')
+    # Zone 1: Infinite Memory (Param ~ 0)
+    ax.axvline(x=0.05, color='blue', linestyle='--', alpha=0.3)
+    ax.text(0.1, text_y, "Infinite Memory\nr≈1.0\n(Hubs)", 
+            ha='left', va='top', color='blue', fontsize=9, fontweight='bold')
+
+    # Zone 2: Working Memory (Param ~ 0.1)
+    ax.axvline(x=0.2, color='green', linestyle='--', alpha=0.3)
+    ax.text(0.5, text_y*0.5, "Working Memory\nr≈0.9\n(Lattice)", 
+            ha='left', va='top', color='green', fontsize=9, fontweight='bold')
+
+    # Zone 3: Zero Memory (Param ~ 15)
+    ax.axvline(x=14.0, color='red', linestyle='--', alpha=0.3)
+    ax.text(14.5, text_y, "Zero Memory\nr≈0.0\n(Rewired)", 
+            ha='right', va='top', color='red', fontsize=9, fontweight='bold')
     
     ax.set_title(f"Small-World Topology at Step {step_num}\n(Decay Parameter Distribution)")
-    ax.set_xlabel("Decay Parameter (higher → longer memory)")
+    ax.set_xlabel("Decay Parameter p (r = e^-p)")
     ax.set_ylabel("Count (Log Scale)")
-    ax.legend(loc='upper left')
+    ax.legend(loc='upper right')
     ax.grid(True, alpha=0.3, which="both")
     
     plt.tight_layout()
@@ -287,31 +287,28 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     nonhub_activity = activity_avg[:, ~is_hub].T  # (num_nonhubs, Time)
     nonhub_decays = decay_params[~is_hub]
     
-    # Sort non-hubs by decay_param (Low/Noise -> High/Infinite)
+    # Sort non-hubs by decay_param (Low -> High)
+    # Low Param = Infinite Memory (Top of list)
+    # High Param = Zero Memory (Bottom of list)
     sort_indices = np.argsort(nonhub_decays)
     nonhub_activity_sorted = nonhub_activity[sort_indices, :]
     
-    # Downsample if needed (to match visual height of Hubs for comparison)
-    # We use nearest-neighbor interpolation via linspace
+    # Downsample visual
     if nonhub_activity_sorted.shape[0] > hubs_activity.shape[0] * 2:
         indices = np.linspace(0, nonhub_activity_sorted.shape[0]-1, 
                              hubs_activity.shape[0] * 2, dtype=int)
         nonhub_activity_sorted = nonhub_activity_sorted[indices, :]
 
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
-    
-    # Use robust quantiles for vmin/vmax to prevent outliers from washing out the plot
-    # But strictly 0 minimum since activity is positive (ReLU/GLU/etc output usually)
     robust_max = np.percentile(activity_avg, 99) 
     
     sns.heatmap(hubs_activity, ax=ax1, cmap="magma", cbar=True, vmin=0, vmax=robust_max)
-    ax1.set_title("Hub Activity (Self-Pairs, Infinite Memory)")
+    ax1.set_title("Hub Activity (Self-Pairs)")
     ax1.set_ylabel("Hub Neurons")
     
     sns.heatmap(nonhub_activity_sorted, ax=ax2, cmap="viridis", cbar=True, vmin=0, vmax=robust_max)
-    ax2.set_title("Connection Activity (Sorted by Decay Parameter)\n" + 
-                 "(Bottom = Fast Decay, Top = Infinite)")
-    ax2.set_ylabel("Connections\n(Sorted Low $\\to$ High Decay)")
+    ax2.set_title("Connection Activity\n(Top = Infinite Memory/Lattice, Bottom = Zero Memory/Rewired)")
+    ax2.set_ylabel("Connections (Sorted by Param)")
     ax2.set_xlabel("Time Steps")
     
     plt.tight_layout()
@@ -322,19 +319,17 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
 def visualize_evolution_metrics(model, synch_out_viz, save_path="sw_evolution.png"):
     activity = synch_out_viz
     
-    # 1. Hub Extraction (Safe Mode)
+    # Hub Extraction
     left = model.out_neuron_indices_left.detach().cpu().numpy()
     right = model.out_neuron_indices_right.detach().cpu().numpy()
     self_loop_edge_mask = (left == right)
     
-    # Calculate global mean activity over Batch and Time (Shape: [Neurons])
-    global_mean_activity = activity.abs().mean(dim=(0, 1)).numpy() 
-    # Use a flag to track if we found hubs or fell back to global
+    # Calculate global mean activity over Batch (0) and Time (1) -> Shape: [Neurons]
+    global_mean_activity = np.abs(activity).mean(axis=(0, 1))
+    
     hubs_only_flag = False 
     if self_loop_edge_mask.any():
-        # Get the actual Neuron IDs that are hubs
         hub_neuron_ids = left[self_loop_edge_mask]
-        # Slice the global_mean_activity vector using the correct IDs
         hubs_only = global_mean_activity[hub_neuron_ids]
         hubs_only_flag = True
     else:
@@ -342,34 +337,31 @@ def visualize_evolution_metrics(model, synch_out_viz, save_path="sw_evolution.pn
         threshold = np.percentile(global_mean_activity, 90)
         hubs_only = global_mean_activity[global_mean_activity > threshold]
 
-    # 2. Vital Signs
+    # Vital Signs
     dead_hub_rate = (hubs_only < 1e-6).sum() / (len(hubs_only) + 1e-9)
-    global_energy = global_mean_activity.sum() # Global energy across all neurons
+    global_energy = global_mean_activity.sum() 
 
-    # 3. Distribution Metrics
-    # ---------------------------------------------------------
-    # Gini (Inequality)
+    # Metrics
     sorted_hubs = np.sort(hubs_only)
     n = len(hubs_only)
     index = np.arange(1, n + 1)
-    # Add epsilon to divisor to prevent div/0
     gini = ((2 * index - n - 1) * sorted_hubs).sum() / (n * sorted_hubs.sum() + 1e-9)
 
-    # Entropy (Sharpness)
     p = hubs_only / (hubs_only.sum() + 1e-9)
     entropy = -np.sum(p * np.log(p + 1e-9))
 
-    # Effective Rank (Diversity)
+    # Effective Rank
     # We measure the SVD of the activity, averaged over time (axis 1)
-    batch_activity = activity.abs().mean(dim=1).numpy()
+    batch_activity = np.abs(activity).mean(axis=1)
     try:
         _, S, _ = np.linalg.svd(batch_activity)
         singular_vals = S / S.sum()
         effective_rank = np.exp(-np.sum(singular_vals * np.log(singular_vals + 1e-9)))
     except:
-        effective_rank = 0.0 # Handle singular matrix crash
+        effective_rank = 0.0
+        singular_vals = np.zeros(10)
 
-    # 4. Visualization
+    # Visualization
     fig, ax = plt.subplots(1, 4, figsize=(20, 5))
 
     # Plot A: Lorenz Curve
@@ -386,7 +378,7 @@ def visualize_evolution_metrics(model, synch_out_viz, save_path="sw_evolution.pn
 
     # Plot C: Dimensionality (Rank)
     ax[2].plot(singular_vals[:min(50, len(singular_vals))], marker='o', markersize=3, color='green')
-    ax[2].set_title(f"Feature Diversity\nRank: {effective_rank:.1f}/{min(activity.shape[0], activity.shape[2])}")
+    ax[2].set_title(f"Feature Diversity\nRank: {effective_rank:.1f}")
     ax[2].set_ylabel("Singular Val Strength")
 
     plt.tight_layout()
@@ -403,90 +395,89 @@ def visualize_evolution_metrics(model, synch_out_viz, save_path="sw_evolution.pn
 
 
 def visualize_topology_matrix(model, save_path="sw_matrix.png"):
-    """
-    Visualizes the Small-World connectivity as an Adjacency Matrix Scatter Plot.
-    This is often superior to circular graph plots for verifying locality.
-    """
-    # 1. Extract Data
+    """Visualizes the Small-World connectivity as an Adjacency Matrix Scatter Plot."""
     left = model.out_neuron_indices_left.cpu().numpy()
     right = model.out_neuron_indices_right.cpu().numpy()
     decays = model.decay_params_out.detach().cpu().numpy()
-    
     d_model = model.d_model
     
-    # 2. Classify Edges
-    # Masks based on your confirmed logic
+    # Masks
     mask_self = (left == right)
-    mask_noise = (~mask_self) & (decays < 1.0)
-    mask_lattice = (~mask_self) & (decays > 1.0) & (decays < 10.0)
+    
+    # Lattice = Working Memory (Param ~ 0.1)
+    # Filter: Not Self AND Param is Small (< 1.0)
+    mask_lattice = (~mask_self) & (decays < 1.0)
+    
+    # Rewired/Noise = Zero Memory (Param ~ 15.0)
+    # Filter: Not Self AND Param is Large (> 10.0)
     mask_rewired = (~mask_self) & (decays > 10.0)
     
-    # 3. Setup Plot
     plt.figure(figsize=(12, 12))
     
-    # A. Plot Rewired (Blue) - Global Scatter
-    # Plot these first so they are in the background
+    # Plot Rewired (Red/Blue) - Background
     plt.scatter(left[mask_rewired], right[mask_rewired], 
-                c='blue', s=15, alpha=0.4, label='Rewired (Global Shortcut)', marker='.')
+                c='blue', s=15, alpha=0.3, label='Rewired/Noise (Zero Mem)', marker='.')
                 
-    # B. Plot Lattice (Green) - The Diagonal Band
-    # Plot these second to ensure they are visible
+    # Plot Lattice (Green) - Foreground Band
     plt.scatter(left[mask_lattice], right[mask_lattice], 
-                c='green', s=15, alpha=0.6, label='Lattice (Working Memory)', marker='.')
+                c='green', s=20, alpha=0.8, label='Lattice (Working Mem)', marker='.')
 
-    # C. Plot Hubs (Dark Blue) - The Spine
+    # Plot Hubs (Dark Blue) - Spine
     plt.scatter(left[mask_self], right[mask_self], 
-                c='navy', s=40, alpha=1.0, label='Hubs (Infinite Memory)', marker='o')
+                c='navy', s=50, alpha=1.0, label='Hubs (Infinite Mem)', marker='o')
 
-    # D. Plot Noise (Red)
-    plt.scatter(left[mask_noise], right[mask_noise], 
-                c='red', s=20, alpha=1.0, label='Noise (Fast Decay)', marker='x')
-
-    # 4. Styling
-    plt.title(f"Small-World Adjacency Matrix\n(d_model={d_model}, Total Edges={len(left)})")
-    plt.xlabel("Source Neuron Index")
-    plt.ylabel("Target Neuron Index")
+    plt.title(f"Small-World Adjacency Matrix\n(d_model={d_model}, Edges={len(left)})")
+    plt.xlabel("Source")
+    plt.ylabel("Target")
     plt.xlim(0, d_model)
     plt.ylim(0, d_model)
-    
-    # Invert Y axis to match standard matrix notation (0,0 at top left)
     plt.gca().invert_yaxis()
-    
     plt.legend(loc='upper right')
-    plt.grid(True, which='both', linestyle='--', linewidth=0.5, alpha=0.3)
+    plt.grid(True, alpha=0.2)
     
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
     plt.close()
 
-# --- CONFIGURATION: NEON PALETTE (Dark Mode Optimized) ---
-# Designed to pop against Black/Dark Grey backgrounds
-COLOR_HUB     = "#E056FD"  # Electric Purple (The Anchors)
-COLOR_REWIRED = "#00FFFF"  # Cyan (The Shortcuts)
-COLOR_LATTICE = "#00FF7F"  # Spring Green (The Mesh)
-COLOR_NOISE   = "#FF0055"  # Hot Pink/Red (The Noise)
+
+# --- CONFIGURATION: NEON PALETTE ---
+COLOR_HUB     = "#E056FD"  # Electric Purple
+COLOR_REWIRED = "#00FFFF"  # Cyan
+COLOR_LATTICE = "#00FF7F"  # Spring Green
+COLOR_NOISE   = "#FF0055"  # Hot Pink/Red
 
 def get_edge_properties(s, t, decay_val):
     """
     Helper to classify edge types and weights based on memory horizon.
-    Returns: (Category, Color, Weight)
-    """
-    # Weight Scaling: Maps Decay Param to Physics Gravity
-    # Param 15.0 -> Weight ~3.0 (Strong Pull)
-    # Param  2.3 -> Weight ~0.4 (Weak Pull)
-    SCALE_FACTOR = 0.2
+
+    - Param 0.0  -> Hub (Infinite Mem)
+    - Param 0.1  -> Lattice (Working Mem)
+    - Param 15.0 -> Rewired (Zero Mem)
     
-    raw_weight = float(decay_val)
-    viz_weight = max(raw_weight * SCALE_FACTOR, 0.1)
+    GEPHI PHYSICS (ForceAtlas2):
+    - Weight determines attraction strength.
+    - We want the LATTICE (Ring) to define the shape -> High Weight.
+    - We want REWIRED to be visible shortcuts but not crush the ring -> Lower Weight.
+    """
+    decay_val = float(decay_val)
 
     if s == t:
-        return "Hub (Infinite)", COLOR_HUB, 4.0 # Force Hubs to be very rigid
+        # Hubs: Self-loops don't affect layout, but we mark them clearly
+        return "Hub (Infinite)", COLOR_HUB, 1.0 
+        
     elif decay_val > 10.0:
-        return "Rewired (Global)", COLOR_REWIRED, viz_weight
-    elif decay_val > 1.0:
-        return "Lattice (Working)", COLOR_LATTICE, viz_weight
+        # Param ~15.0 -> Rewired (Zero Memory)
+        # Visual: Lighter weight (1.0) so they appear as "chords" across the ring
+        return "Rewired (Global)", COLOR_REWIRED, 1.0
+        
+    elif decay_val < 2.0:
+        # Param ~0.1 -> Lattice (Working Memory)
+        # Visual: High weight (5.0) to force the nodes into the Ring topology
+        return "Lattice (Working)", COLOR_LATTICE, 5.0
+        
     else:
-        return "Noise (Fast)", COLOR_NOISE, 0.1 # Noise has almost no gravity
+        # Fallback for noise or transition states
+        return "Noise", COLOR_NOISE, 0.1
 
 def export_full_network(model, save_path="sw_full_network.graphml"):
     """
@@ -506,62 +497,17 @@ def export_full_network(model, save_path="sw_full_network.graphml"):
         s, t = int(s), int(t)
         category, color, weight = get_edge_properties(s, t, d)
         
-        # Node Sizing Logic
-        # Active Hubs (Sources) are Large (20)
-        # Passive Targets are Small (10) unless they are also Hubs
-        s_size = 20.0
-        t_size = 20.0 if t in active_hubs else 8.0
+        # Sizing: Hubs are large anchors
+        s_size = 30.0
+        t_size = 30.0 if t in active_hubs else 10.0
         
         G.add_node(s, label=f"Neuron {s}", Category="Hub", Size=s_size, Color=COLOR_HUB)
         if not G.has_node(t):
-            G.add_node(t, label=f"Neuron {t}", Category="Neighbor", Size=t_size, Color=COLOR_LATTICE)
+            # Target might not be a source (Hub), so we label it Neighbor
+            cat = "Hub" if t in active_hubs else "Neighbor"
+            col = COLOR_HUB if t in active_hubs else COLOR_LATTICE
+            G.add_node(t, label=f"Neuron {t}", Category=cat, Size=t_size, Color=col)
             
         G.add_edge(s, t, weight=weight, Type=category, Color=color, Param=float(d))
         
-    nx.write_graphml(G, save_path)
-
-
-def export_to_gephi(model, save_path="sw_network.graphml", n_hubs=32):
-    """
-    Exports a clean, filtered subset of the Small-World topology to GraphML.
-    
-    Optimized for Dark Mode / Gephi:
-    - Uses 'Decay Parameter' as Edge Weight (Physics: Gravity).
-    - Uses 'Visual Hierarchy' for Colors (Lattice is dim to reduce clutter).
-    """
-    
-    left = model.out_neuron_indices_left.cpu().numpy()
-    right = model.out_neuron_indices_right.cpu().numpy()
-    decays = model.decay_params_out.detach().cpu().numpy()
-    
-    # Filter Logic
-    unique_hubs = np.unique(left)
-    selected_hubs = unique_hubs[:n_hubs] # Contiguous slice to preserve ring geometry
-    mask = np.isin(left, selected_hubs)
-    
-    sources = left[mask]
-    targets = right[mask]
-    edge_decays = decays[mask]
-    
-    G = nx.DiGraph()
-    
-    for s, t, d in zip(sources, targets, edge_decays):
-        s, t = int(s), int(t)
-        category, color, weight = get_edge_properties(s, t, d)
-        
-        # Node Sizing Logic
-        # Source is always a selected Hub -> Large
-        # Target is Large ONLY if it is also in our selected subset
-        t_is_hub = t in selected_hubs
-        t_size = 20.0 if t_is_hub else 8.0
-        t_cat = "Hub" if t_is_hub else "Neighbor"
-        
-        G.add_node(s, label=f"Neuron {s}", Category="Hub", Size=20.0, Color=COLOR_HUB)
-        
-        # Only add target if not present (preserve Hub properties if it exists)
-        if not G.has_node(t):
-            G.add_node(t, label=f"Neuron {t}", Category=t_cat, Size=t_size, Color=COLOR_LATTICE if not t_is_hub else COLOR_HUB)
-            
-        G.add_edge(s, t, weight=weight, Type=category, Color=color, Param=float(d))
-
     nx.write_graphml(G, save_path)

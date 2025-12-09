@@ -120,9 +120,9 @@ def test_decay_initialization_priors(ctm_factory, base_params, device):
     """
     Property Test: Decay Initialization Hierarchy.
     Verifies that parameters are initialized according to the 3-tier logic:
-    1. Self-Pair (Identity) -> 0.0 (Infinite Memory)
-    2. Lattice (Memory) -> ~0.1 (Long Memory)
-    3. Rewired (Transient) -> ~1.0 (Short Memory)
+    1. Self-Pair (Identity) -> 0.0 (Infinite Memory / Integrator)
+    2. Lattice (Memory) -> ~0.1 (Working Memory / Diffusive)
+    3. Rewired (Transient) -> ~15.0 (Zero Memory / Teleportation)
     """
     d_model = 100
     n_synch = 500 # High budget to ensure we see all types
@@ -142,27 +142,30 @@ def test_decay_initialization_priors(ctm_factory, base_params, device):
     right = model.out_neuron_indices_right.cpu()
     decay_params = model.decay_params_out.detach().cpu()
     
-    # 1. Verify Self-Pairs (Identity)
+    # 1. Verify Self-Pairs (Hubs/Identity)
+    # Rationale: Hubs must be perfect integrators (r=1.0, param=0.0)
     self_mask = (left == right)
     self_decays = decay_params[self_mask]
-    
-    # Self-pairs should have high decay_param (≈15)
-    assert torch.all(self_decays > 14.0), "Self-pairs need large decay_param for infinite memory"
-    
+    assert torch.all(self_decays < 0.05), f"Hubs must have Infinite Memory (param ~ 0). Found mean: {self_decays.mean()}"
+
     # 2. Verify Others (Lattice vs Rewired)
     other_mask = ~self_mask
     other_decays = decay_params[other_mask]
     
-    # We simply check that we have a bimodal distribution
-    # Lattice (r=0.1) requires param ~ 2.30
-    # Rewired (r=1.0) requires param ~ inf/large
-    # Note: Noise is +/- 0.01
+    # We expect a bimodal distribution:
+    # Mode A: Lattice edges -> Working Memory -> Param ~ 0.1
+    # Mode B: Rewired edges -> Zero Memory -> Param ~ 15.0
     
-    has_lattice = torch.any((other_decays > 2.25) & (other_decays < 2.35))
-    has_rewired = torch.any((other_decays > 14.0))  # Not 0!
+    # Check for Lattice Presence (Working Memory)
+    # Allowing for noise (+/- 0.01), so range [0.08, 0.12] is safe for 0.1 base
+    has_lattice = torch.any((other_decays > 0.05) & (other_decays < 0.2))
 
-    assert has_lattice, "Missing Lattice (Local) decay priors (~0.1)"
-    assert has_rewired, "Missing Rewired (Global) decay priors (~1.0)"
+    # Check for Rewired Presence (Zero Memory)
+    # Param should be very high (15.0)
+    has_rewired = torch.any(other_decays > 10.0)
+
+    assert has_lattice, "Missing Lattice edges with Working Memory (param ~ 0.1)"
+    assert has_rewired, "Missing Rewired edges with Zero Memory (param > 10.0)"
 
 
 # --- 4. Dynamic Safety Tests ---

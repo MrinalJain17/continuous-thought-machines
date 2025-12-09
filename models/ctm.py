@@ -592,27 +592,32 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             all_decay_types = torch.cat([all_decay_types, fill_decay])
         
         # --- Logic: Map Types to Parameters ---
-        # Type 0.0 -> Lattice -> PARAM_WORKING (2.3) -> Green
-        # Type 1.0 -> Rewired -> PARAM_INFINITE (15.0) -> Blue
-        # Type 2.0 -> Noise   -> PARAM_NOISE (0.0) -> Red
-        
-        PARAM_INFINITE = 15.0      # r ~ 0.0
-        PARAM_WORKING = 2.302585   # r ~ 0.1
-        PARAM_NOISE = 0.0          # r ~ 1.0 (Fast Decay)
 
-        # Default to Lattice (Green)
+        # param = 0.0 -> r = e^-0 = 1.0 -> Accumulates forever
+        PARAM_INFINITE = 0.0
+
+        # param = 0.1 -> r = e^-0.1 ≈ 0.90 -> Half-life ~7 steps
+        PARAM_WORKING = 0.1 
+
+        # param = 15.0 -> r = e^-15 ≈ 0.0 -> Forgets instantly
+        PARAM_ZERO = 15.0
+
+        # A. Lattice (Local Neighbors) -> Working Memory
+        # Rationale: Local diffusion needs to persist to form "paths" or "waves".
         decay_init = torch.full_like(all_decay_types, PARAM_WORKING)
         
-        # Overwrite Rewired (Blue)
-        decay_init[all_decay_types == 1.0] = PARAM_INFINITE
+        # B. Rewired (Global Shortcuts) -> Zero Memory
+        # Rationale: Shortcuts should teleport CURRENT signals. 
+        decay_init[all_decay_types == 1.0] = PARAM_ZERO 
         
-        # Overwrite Noise (Red) - The 7 remainder edges go here
-        decay_init[all_decay_types == 2.0] = PARAM_NOISE
+        # C. Noise (Remainder Edges) -> Zero Memory
+        decay_init[all_decay_types == 2.0] = PARAM_ZERO
 
         # Add noise to allow learning diversity
         decay_init += torch.randn_like(decay_init) * 0.01
 
-        # Ensure self-pairs have infinite memory
+        # D. Hubs (Self-Pairs) -> Infinite Memory
+        # Rationale: Identity must be preserved perfectly.
         decay_init[:num_hubs] = PARAM_INFINITE
         
         return all_left, all_right, decay_init
