@@ -371,11 +371,11 @@ if __name__=='__main__':
     if args.do_compile:
         print('Compiling...')
         if hasattr(model, 'backbone'):
-            model.backbone = torch.compile(model.backbone, mode='reduce-overhead', fullgraph=True)
+            model.backbone = torch.compile(model.backbone, mode='default', fullgraph=True)
         # Compile synapses and NLMs only for CTM
         if args.model == 'ctm':
-            model.synapses = torch.compile(model.synapses, mode='reduce-overhead', fullgraph=True)
-            model.trace_processor = torch.compile(model.trace_processor, mode='reduce-overhead', fullgraph=True)
+            model.synapses = torch.compile(model.synapses, mode='default', fullgraph=True)
+            model.trace_processor = torch.compile(model.trace_processor, mode='default', fullgraph=True)
 
     if args.model == 'ctm' and hasattr(model, 'out_neuron_indices_left'):
         export_full_network(model, save_path=f"{args.log_dir}/sw_full_network.graphml")
@@ -414,8 +414,8 @@ if __name__=='__main__':
 
             # Model-specific forward, reshape, and loss calculation
             with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", dtype=torch.float16, enabled=args.use_amp):
-                if args.do_compile: # CUDAGraph marking applied if compiling any model
-                     torch.compiler.cudagraph_mark_step_begin()
+                # if args.do_compile: # CUDAGraph marking applied if compiling any model
+                #      torch.compiler.cudagraph_mark_step_begin()
 
                 if args.model == 'ctm':
                     # CTM output: (B, SeqLength*5, Ticks), Certainties: (B, Ticks)

@@ -60,7 +60,7 @@ python -m tasks.mazes.train \
     --memory_hidden_dims 32 \
     --connectivity 4 \
     --rewiring_prob 0.2 \
-    --batch_size 32 \
+    --batch_size 64 \
     --training_iterations 100000 \
     --device 0 \
     --use_amp
