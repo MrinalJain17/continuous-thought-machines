@@ -236,14 +236,15 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     # PLOT 1: Topology Structure (Log-Scale Histogram)
     # =========================================================
     fig, ax = plt.subplots(figsize=(10, 6))
+    bins = np.linspace(-0.5, 16.5, 200)
     
     # Plot Hubs (Blue) - should peak near 0.0 (Infinite Memory)
     sns.histplot(decay_params[is_hub], color="blue", label="Hubs (Self-Pairs)", 
-                 kde=False, bins=60, alpha=0.6, ax=ax)
+                 kde=False, bins=bins, alpha=0.6, ax=ax)
     
     # Plot Non-Hubs (Orange) - bimodal: Lattice (~0.1) and Rewired (~15.0)
     sns.histplot(decay_params[~is_hub], color="orange", label="Connections", 
-                 kde=False, bins=60, alpha=0.6, ax=ax)
+                 kde=False, bins=bins, alpha=0.6, ax=ax)
     
     ax.set_yscale('log')
     ax.set_xlim(-0.5, 16.5)
@@ -368,7 +369,7 @@ def visualize_evolution_metrics(model, synch_out_viz, save_path="sw_evolution.pn
         singular_vals = np.zeros(10)
 
     # Visualization
-    fig, ax = plt.subplots(1, 4, figsize=(20, 5))
+    fig, ax = plt.subplots(1, 3, figsize=(22, 6))
 
     # Plot A: Lorenz Curve
     lorenz_curve = np.cumsum(sorted_hubs) / (sorted_hubs.sum() + 1e-9)

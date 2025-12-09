@@ -751,17 +751,12 @@ if __name__=='__main__':
                                 
                                 self_loop_edge_mask = (left == right)
                                 if self_loop_edge_mask.any():
-                                    hub_neuron_ids = left[self_loop_edge_mask]
-                                    raw_activity = activity_np[:, :, hub_neuron_ids] # -> (Batch, Time, Num_Hubs)
+                                    raw_activity = activity_np[:, :, self_loop_edge_mask] # -> (Batch, Time, Num_Hubs)
                                     label = "Hub"
                                     
                                     # Calculate Decay Rates (Hubs vs Others)
-                                    self_decay = decay[hub_neuron_ids].mean()
-                                    
-                                    # Create mask for "Other" neurons
-                                    all_indices = np.arange(len(decay))
-                                    other_mask = ~np.isin(all_indices, hub_neuron_ids)
-                                    other_decay = decay[other_mask].mean()
+                                    self_decay = decay[self_loop_edge_mask].mean()
+                                    other_decay = decay[~self_loop_edge_mask].mean()
                                     decay_str = f"| Decay: Self={self_decay:.3f} / Other={other_decay:.3f}"
                                     
                                 else:
