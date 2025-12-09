@@ -324,13 +324,12 @@ def visualize_evolution_metrics(model, synch_out_viz, save_path="sw_evolution.pn
     right = model.out_neuron_indices_right.detach().cpu().numpy()
     self_loop_edge_mask = (left == right)
     
-    # Calculate global mean activity over Batch (0) and Time (1) -> Shape: [Neurons]
+    # Calculate global mean activity over Batch (0) and Time (1) -> Shape: [n_synch_edges]
     global_mean_activity = np.abs(activity).mean(axis=(0, 1))
     
     hubs_only_flag = False 
     if self_loop_edge_mask.any():
-        hub_neuron_ids = left[self_loop_edge_mask]
-        hubs_only = global_mean_activity[hub_neuron_ids]
+        hubs_only = global_mean_activity[self_loop_edge_mask]
         hubs_only_flag = True
     else:
         # Fallback: If no self-loops, treat top 10% most active neurons as "functional hubs"
@@ -353,9 +352,16 @@ def visualize_evolution_metrics(model, synch_out_viz, save_path="sw_evolution.pn
     # Effective Rank
     # We measure the SVD of the activity, averaged over time (axis 1)
     batch_activity = np.abs(activity).mean(axis=1)
+    
+    # This tells us if the "Core" is collapsing or diverse
+    if self_loop_edge_mask.any():
+        target_activity = batch_activity[:, self_loop_edge_mask]
+    else:
+        target_activity = batch_activity
+
     try:
-        _, S, _ = np.linalg.svd(batch_activity)
-        singular_vals = S / S.sum()
+        _, S, _ = np.linalg.svd(target_activity)
+        singular_vals = S / (S.sum() + 1e-9)
         effective_rank = np.exp(-np.sum(singular_vals * np.log(singular_vals + 1e-9)))
     except:
         effective_rank = 0.0
