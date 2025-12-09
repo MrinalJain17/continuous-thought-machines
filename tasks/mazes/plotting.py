@@ -446,7 +446,7 @@ COLOR_REWIRED = "#00FFFF"  # Cyan
 COLOR_LATTICE = "#00FF7F"  # Spring Green
 COLOR_NOISE   = "#FF0055"  # Hot Pink/Red
 
-def get_edge_properties(s, t, decay_val):
+def get_edge_properties(s, t, decay_val, active_hubs):
     """
     Helper to classify edge types and weights based on memory horizon.
 
@@ -466,18 +466,20 @@ def get_edge_properties(s, t, decay_val):
         return "Hub (Infinite)", COLOR_HUB, 1.0 
         
     elif decay_val > 10.0:
-        # Param ~15.0 -> Rewired (Zero Memory)
-        # Visual: Lighter weight (1.0) so they appear as "chords" across the ring
-        return "Rewired (Global)", COLOR_REWIRED, 1.0
-        
+        # Zero Memory (High Param)
+        if t in active_hubs:
+            # Connects two Hubs = Global Shortcut
+            return "Rewired (Global)", COLOR_REWIRED, 1.0
+        else:
+            # Connects Hub to Passive Neuron = Noise
+            return "Noise", COLOR_NOISE, 0.1
+            
     elif decay_val < 2.0:
         # Param ~0.1 -> Lattice (Working Memory)
         # Visual: High weight (5.0) to force the nodes into the Ring topology
         return "Lattice (Working)", COLOR_LATTICE, 5.0
         
-    else:
-        # Fallback for noise or transition states
-        return "Noise", COLOR_NOISE, 0.1
+    return "Unknown", "#FFFFFF", 0.1
 
 def export_full_network(model, save_path="sw_full_network.graphml"):
     """
@@ -495,7 +497,7 @@ def export_full_network(model, save_path="sw_full_network.graphml"):
     
     for s, t, d in zip(left, right, decays):
         s, t = int(s), int(t)
-        category, color, weight = get_edge_properties(s, t, d)
+        category, color, weight = get_edge_properties(s, t, d, active_hubs)
         
         # Sizing: Hubs are large anchors
         s_size = 30.0

@@ -494,7 +494,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
 
     def _generate_small_world_indices(self, d_model, n_synch, k, p):
         """
-        Generates indices for a Small-World topology that adapts to budget constraints.
+        Generates indices for a Small-World topology (Watts-Strogatz).
         
         Logic:
         1. Calculate 'cost per hub': 1 (self-pair) + k (neighbors).
@@ -520,72 +520,81 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             return left, right, decay_init
 
         # --- PATH B: Small-World Generation ---
+        # Identify Hub Neurons (spaced evenly across d_model)
+        # e.g., [0, 20, 40, ...]
         hubs = torch.linspace(0, d_model - 1, steps=num_hubs).long().to(device)
         
-        # Self-Pairs
-        self_left = hubs
-        self_right = hubs
-        self_decay = torch.zeros(num_hubs, device=device) # Placeholder
-
-        # Neighbors
+        # --- LATTICE GENERATION (RING BACKBONE) ---
+        
+        # We work in "Hub Index Space" (0..num_hubs-1) first
+        hub_indices = torch.arange(num_hubs, device=device)
+        
+        # Self-Pairs (Hub i -> Hub i)
+        self_src_idx = hub_indices
+        self_tgt_idx = hub_indices
+        
+        # Neighbor Offsets in Hub Space (-2, -1, +1, +2)
         offsets = torch.cat([
             torch.arange(1, neighbors_per_side + 1, device=device),
             -torch.arange(1, neighbors_per_side + 1, device=device)
         ])
         
-        # Broadcast to create lattice targets: (num_hubs, actual_k)
-        # Use modulo for ring topology
-        lattice_targets = (hubs.unsqueeze(1) + offsets.unsqueeze(0)) % d_model
+        # Calculate Targets in Hub Space (Ring Topology via Modulo)
+        # Shape: (num_hubs, k)
+        neighbor_tgt_idx = (hub_indices.unsqueeze(1) + offsets.unsqueeze(0)) % num_hubs
+        neighbor_src_idx = hub_indices.unsqueeze(1).expand(-1, actual_k)
         
-        # Create source indices matching targets
-        sources = hubs.unsqueeze(1).expand(-1, actual_k)
+        # Flatten
+        flat_src_idx = neighbor_src_idx.reshape(-1)
+        flat_tgt_idx = neighbor_tgt_idx.reshape(-1)
         
-        # Vectorized Rewiring
-        # Generate random mask for rewiring (p)
-        rand_mask = torch.rand(lattice_targets.shape, device=device) < p
+        # --- REWIRING (SHORTCUTS) ---
         
-        # Generate random targets for where mask is True
-        random_targets = torch.randint(0, d_model, lattice_targets.shape, device=device)
+        # Mask for rewiring
+        rand_mask = torch.rand(flat_src_idx.shape, device=device) < p
         
-        # Fix self-loops in random targets (simple rejection sampling)
-        # If random target == source, pick a new random target.
-        collisions = (random_targets == sources)
+        # Generate Random Targets (Shortcuts)
+        # CRITICAL DECISION: Shortcuts should also target *Hubs* to keep the backbone closed.
+        # This ensures high clustering and reachability within the 'Rich Club'.
+        random_tgt_idx = torch.randint(0, num_hubs, flat_tgt_idx.shape, device=device)
+        
+        # Handle self-loops in rewiring
+        collisions = (random_tgt_idx == flat_src_idx)
         if collisions.any():
-            random_targets[collisions] = torch.randint(0, d_model, (collisions.sum(),), device=device)
+            random_tgt_idx[collisions] = torch.randint(0, num_hubs, (collisions.sum(),), device=device)
             
-        # Combine: Choose random target if rewired, else lattice target
-        final_targets = torch.where(rand_mask, random_targets, lattice_targets)
+        # Apply Rewiring
+        final_tgt_idx = torch.where(rand_mask, random_tgt_idx, flat_tgt_idx)
         
-        # Define decay types: 1.0 for rewired (Global), 0.0 for lattice (Local)
-        neighbor_decay = torch.where(rand_mask, torch.tensor(1.0, device=device, dtype=torch.float32), torch.tensor(0.0, device=device, dtype=torch.float32))
+        # Define Decay Types
+        # 0.0 = Lattice (Working Mem), 15.0 = Rewired (Zero Mem)
+        # Note: We assign these here, then map to params later
+        decay_types = torch.where(rand_mask, 
+                                  torch.tensor(1.0, device=device),  # Rewired type
+                                  torch.tensor(0.0, device=device))  # Lattice type
 
-        # Assembly
-        # Flatten neighbor arrays
-        sources_flat = sources.reshape(-1)
-        targets_flat = final_targets.reshape(-1)
-        neighbor_decay_flat = neighbor_decay.reshape(-1)
+        # --- MAP BACK TO REAL NEURON IDs ---
         
-        # Concatenate Self-Pairs + Neighbors
-        all_left = torch.cat([self_left, sources_flat])
-        all_right = torch.cat([self_right, targets_flat])
-        all_decay_types = torch.cat([self_decay, neighbor_decay_flat])
+        # Self-Pairs
+        all_left = hubs[self_src_idx]
+        all_right = hubs[self_tgt_idx]
+        all_decay_types = torch.zeros(num_hubs, device=device) # Self type (0.0 placeholder)
         
-        # Truncate if we somehow exceeded budget
-        if all_left.size(0) > n_synch:
-            all_left = all_left[:n_synch]
-            all_right = all_right[:n_synch]
-            all_decay_types = all_decay_types[:n_synch]
-            
-        # Fill Remainder if budget exists
-        # This occurs due to integer division (n_synch // cost_per_node)
+        # Neighbors
+        all_left = torch.cat([all_left, hubs[flat_src_idx]])
+        all_right = torch.cat([all_right, hubs[final_tgt_idx]])
+        all_decay_types = torch.cat([all_decay_types, decay_types])
+        
+        # --- FILL REMAINDER (BUDGET CLEANUP) ---
         remainder = n_synch - all_left.size(0)
         if remainder > 0:
-            fill_left = torch.randint(0, d_model, (remainder,), device=device)
+            # Connect random Hubs to random Neurons (Noise/Sampling)
+            fill_left = hubs[torch.randint(0, num_hubs, (remainder,), device=device)]
             fill_right = torch.randint(0, d_model, (remainder,), device=device)
             
             # CRITICAL FIX: Set remainder decay type to 2.0 (Noise)
             # This prevents them from being classified as Lattice (0.0)
-            fill_decay = torch.full((remainder,), 2.0, device=device)
+            fill_decay = torch.full((remainder,), 2.0, device=device) # Type 2 (Noise)
             
             all_left = torch.cat([all_left, fill_left])
             all_right = torch.cat([all_right, fill_right])
@@ -616,7 +625,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         # Add noise to allow learning diversity
         decay_init += torch.randn_like(decay_init) * 0.01
 
-        # D. Hubs (Self-Pairs) -> Infinite Memory
+        # D. Hubs (Self-Pairs only) -> Infinite Memory
         # Rationale: Identity must be preserved perfectly.
         decay_init[:num_hubs] = PARAM_INFINITE
         
