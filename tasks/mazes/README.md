@@ -17,20 +17,24 @@ python -m tasks.mazes.train --dataset mazes-small --maze_route_length 50 --cirri
 
 ## Small world
 
-Baseline:
+(Assumed) Baseline:
 ```
 python -m tasks.mazes.train \
-    --model ctm \
     --dataset mazes-medium \
-    --log_dir logs/baseline_rectified \
+    --log_dir logs/baseline \
+    --model ctm \
     --d_model 2048 \
+    --dropout 0.1 \
+    --backbone_type resnet34-2 \
     --d_input 512 \
     --heads 16 \
+    --iterations 75 \
+    --synapse_depth 8 \
     --n_synch_out 32 \
     --n_synch_action 32 \
     --neuron_select_type first-last \
-    --synapse_depth 8 \
-    --dropout 0.1 \
+    --memory_length 25 \
+    --memory_hidden_dims 32 \
     --batch_size 64 \
     --training_iterations 100000 \
     --device 0
@@ -40,25 +44,24 @@ Exp (Small World):
 ```
 python -m tasks.mazes.train \
     --dataset mazes-medium \
-    --log_dir logs/small_world_optimized \
+    --log_dir logs/small_world \
     --model ctm \
-    --d_model 1024 \
-    --dropout 0.0 \
-    --backbone_type shallow-wide \
+    --d_model 2048 \
+    --dropout 0.1 \
+    --backbone_type resnet34-2 \
     --d_input 512 \
-    --heads 8 \
+    --heads 16 \
     --iterations 75 \
     --synapse_depth 8 \
-    --n_synch_out 2112 \
-    --n_synch_action 2112 \
+    --n_synch_out 528 \
+    --n_synch_action 528 \
     --neuron_select_type small-world \
-    --connectivity 32 \
-    --rewiring_prob 0.1 \
     --memory_length 25 \
-    --memory_hidden_dims 256 \
+    --memory_hidden_dims 32 \
+    --connectivity 4 \
+    --rewiring_prob 0.2 \
     --batch_size 32 \
     --training_iterations 100000 \
-    --gradient_clipping 1.0 \
     --device 0 \
     --use_amp
 ```

@@ -140,6 +140,9 @@ if __name__=='__main__':
 
     set_seed(args.seed, False)
     if not os.path.exists(args.log_dir): os.makedirs(args.log_dir)
+    diag_dir = f"{args.log_dir}/sw_diagnostics"
+    if not os.path.exists(diag_dir):
+        os.makedirs(diag_dir)
 
     assert args.dataset in ['mazes-medium', 'mazes-large', 'mazes-small']
 
