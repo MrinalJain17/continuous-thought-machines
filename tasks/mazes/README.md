@@ -36,8 +36,7 @@ python -m tasks.mazes.train \
     --memory_length 25 \
     --memory_hidden_dims 32 \
     --batch_size 64 \
-    --training_iterations 100000 \
-    --device 0
+    --training_iterations 100000
 ```
 
 Exp (Small World):
@@ -58,10 +57,9 @@ python -m tasks.mazes.train \
     --neuron_select_type small-world \
     --memory_length 25 \
     --memory_hidden_dims 32 \
-    --connectivity 4 \
-    --rewiring_prob 0.2 \
+    --connectivity 16 \
+    --rewiring_prob 0.3 \
     --batch_size 64 \
     --training_iterations 100000 \
-    --device 0 \
-    --use_amp
+    --device 0 --use_amp --do_compile
 ```

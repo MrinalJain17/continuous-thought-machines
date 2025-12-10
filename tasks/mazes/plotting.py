@@ -240,11 +240,15 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     
     # Plot Hubs (Blue) - should peak near 0.0 (Infinite Memory)
     sns.histplot(decay_params[is_hub], color="blue", label="Hubs (Self-Pairs)", 
-                 kde=False, bins=bins, alpha=0.6, ax=ax)
+                 element="step", fill=True, alpha=0.3, bins=bins, ax=ax)
     
     # Plot Non-Hubs (Orange) - bimodal: Lattice (~0.1) and Rewired (~15.0)
     sns.histplot(decay_params[~is_hub], color="orange", label="Connections", 
-                 kde=False, bins=bins, alpha=0.6, ax=ax)
+                 element="step", fill=True, alpha=0.3, bins=bins, ax=ax)
+    
+    # Add heavy outlines for clarity
+    sns.histplot(decay_params[is_hub], color="blue", element="step", fill=False, lw=2, bins=bins, ax=ax)
+    sns.histplot(decay_params[~is_hub], color="orange", element="step", fill=False, lw=2, bins=bins, ax=ax)
     
     ax.set_yscale('log')
     ax.set_xlim(-0.5, 16.5)
