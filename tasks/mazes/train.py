@@ -741,7 +741,7 @@ if __name__=='__main__':
 
                             # --- Small-World Health Check ---
                             if hasattr(model, 'out_neuron_indices_left'):
-                                visualize_small_world_diagnostics(model, synch_out_viz, f"{args.log_dir}/sw_diagnostics/sw_", bi)
+                                visualize_small_world_diagnostics(model, synch_out_viz, f"{args.log_dir}/sw_diagnostics/sw", bi)
                                 visualize_evolution_metrics(model, synch_out_viz, f'{args.log_dir}/sw_evolution.png')
 
                                 decay = np.exp(-model.decay_params_out.detach().cpu().numpy())

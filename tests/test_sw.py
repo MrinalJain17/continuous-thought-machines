@@ -137,15 +137,14 @@ def test_decay_initialization_priors(ctm_factory, base_params, device):
     """
     Property Test: Decay Initialization Hierarchy.
     Verifies that parameters are initialized according to the 3-tier logic:
-    1. Self-Pair (Identity) -> 0.0 (Infinite Memory / Integrator)
-    2. Lattice (Memory) -> ~0.1 (Working Memory / Diffusive)
-    3. Rewired (Transient) -> ~15.0 (Zero Memory / Teleportation)
+    1. Self-Pair (Hubs) -> ~0.1 (Leaky Integrator / Stable Storage)
+    2. Lattice (Relay)  -> ~0.5 (Fast Diffusion / Relay)
+    3. Rewired (Pulse)  -> ~15.0 (Zero Memory / Teleportation)
     """
     d_model = 100
-    n_synch = 500 # High budget to ensure we see all types
+    n_synch = 500 
     k = 4
     
-    # Force p=0.5 to ensure we get a mix of Lattice and Rewired
     model = ctm_factory(
         base_params,
         d_model=d_model,
@@ -159,29 +158,25 @@ def test_decay_initialization_priors(ctm_factory, base_params, device):
     right = model.out_neuron_indices_right.cpu()
     decay_params = model.decay_params_out.detach().cpu()
     
-    # 1. Verify Self-Pairs (Hubs/Identity)
-    # Rationale: Hubs must be perfect integrators (r=1.0, param=0.0)
+    # Verify Self-Pairs (Hubs)
+    # ~0.1 (Leaky). Allow small noise range [0.08, 0.12]
     self_mask = (left == right)
     self_decays = decay_params[self_mask]
-    assert torch.all(self_decays < 0.05), f"Hubs must have Infinite Memory (param ~ 0). Found mean: {self_decays.mean()}"
+    assert torch.all((self_decays > 0.08) & (self_decays < 0.12)), f"Hubs must be Leaky Integrators (param ~ 0.1). Found mean: {self_decays.mean()}"
 
-    # 2. Verify Others (Lattice vs Rewired)
+    # Verify Others (Lattice vs Rewired)
     other_mask = ~self_mask
     other_decays = decay_params[other_mask]
     
-    # We expect a bimodal distribution:
-    # Mode A: Lattice edges -> Working Memory -> Param ~ 0.1
-    # Mode B: Rewired edges -> Zero Memory -> Param ~ 15.0
-    
-    # Check for Lattice Presence (Working Memory)
-    # Allowing for noise (+/- 0.01), so range [0.08, 0.12] is safe for 0.1 base
-    has_lattice = torch.any((other_decays > 0.05) & (other_decays < 0.2))
+    # Check for Lattice Presence (Fast Relay)
+    # ~0.5. Range [0.4, 0.6] allows for noise variance.
+    has_lattice = torch.any((other_decays > 0.4) & (other_decays < 0.6))
 
     # Check for Rewired Presence (Zero Memory)
     # Param should be very high (15.0)
     has_rewired = torch.any(other_decays > 10.0)
 
-    assert has_lattice, "Missing Lattice edges with Working Memory (param ~ 0.1)"
+    assert has_lattice, "Missing Lattice edges with Fast Relay decay (param ~ 0.5)"
     assert has_rewired, "Missing Rewired edges with Zero Memory (param > 10.0)"
 
 

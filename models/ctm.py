@@ -554,7 +554,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         rand_mask = torch.rand(flat_src_idx.shape, device=device) < p
         
         # Generate Random Targets (Shortcuts)
-        # CRITICAL DECISION: Shortcuts should also target *Hubs* to keep the backbone closed.
+        # Shortcuts should also target *Hubs* to keep the backbone closed.
         # This ensures high clustering and reachability within the 'Rich Club'.
         random_tgt_idx = torch.randint(0, num_hubs, flat_tgt_idx.shape, device=device)
         
@@ -567,7 +567,6 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         final_tgt_idx = torch.where(rand_mask, random_tgt_idx, flat_tgt_idx)
         
         # Define Decay Types
-        # 0.0 = Lattice (Working Mem), 15.0 = Rewired (Zero Mem)
         # Note: We assign these here, then map to params later
         decay_types = torch.where(rand_mask, 
                                   torch.tensor(1.0, device=device),  # Rewired type
@@ -592,7 +591,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             fill_left = hubs[torch.randint(0, num_hubs, (remainder,), device=device)]
             fill_right = torch.randint(0, d_model, (remainder,), device=device)
             
-            # CRITICAL FIX: Set remainder decay type to 2.0 (Noise)
+            # Set remainder decay type to 2.0 (Noise)
             # This prevents them from being classified as Lattice (0.0)
             fill_decay = torch.full((remainder,), 2.0, device=device) # Type 2 (Noise)
             
@@ -602,32 +601,32 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         
         # --- Logic: Map Types to Parameters ---
 
-        # param = 0.0 -> r = e^-0 = 1.0 -> Accumulates forever
-        PARAM_INFINITE = 0.0
-
+        # Hubs (Leaky Integrator)
         # param = 0.1 -> r = e^-0.1 ≈ 0.90 -> Half-life ~7 steps
-        PARAM_WORKING = 0.1 
+        PARAM_HUBS = 0.1
 
+        # Lattice (Fast Relay)
+        # param = 0.5 -> r = e^-0.5 ≈ 0.60 -> Half-life ~1.4 steps
+        PARAM_LATTICE = 0.5 
+
+        # Rewired (Zero Memory)
         # param = 15.0 -> r = e^-15 ≈ 0.0 -> Forgets instantly
         PARAM_ZERO = 15.0
 
-        # A. Lattice (Local Neighbors) -> Working Memory
-        # Rationale: Local diffusion needs to persist to form "paths" or "waves".
-        decay_init = torch.full_like(all_decay_types, PARAM_WORKING)
+        # Lattice (Local Neighbors) -> Fast Relay
+        decay_init = torch.full_like(all_decay_types, PARAM_LATTICE)
         
-        # B. Rewired (Global Shortcuts) -> Zero Memory
-        # Rationale: Shortcuts should teleport CURRENT signals. 
+        # Rewired (Global Shortcuts) -> Zero Memory
         decay_init[all_decay_types == 1.0] = PARAM_ZERO 
         
-        # C. Noise (Remainder Edges) -> Zero Memory
+        # Noise (Remainder Edges) -> Zero Memory
         decay_init[all_decay_types == 2.0] = PARAM_ZERO
 
         # Add noise to allow learning diversity
         decay_init += torch.randn_like(decay_init) * 0.01
 
-        # D. Hubs (Self-Pairs only) -> Infinite Memory
-        # Rationale: Identity must be preserved perfectly.
-        decay_init[:num_hubs] = PARAM_INFINITE
+        # Hubs (Self-Pairs only) -> Leaky Integrator
+        decay_init[:num_hubs] = PARAM_HUBS
         
         return all_left, all_right, decay_init
 

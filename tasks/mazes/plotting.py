@@ -223,8 +223,8 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     2. Heatmap: Sorted by decay_param to visualize functional hierarchy
 
     r = exp(-decay_param)
-    - param ≈ 0.0  → r ≈ 1.0 (Infinite Memory / Hubs)
-    - param ≈ 0.1  → r ≈ 0.9 (Working Memory / Lattice)
+    - param ≈ 0.1  → r ≈ 0.9 (Leaky Integrator / Hubs)
+    - param ≈ 0.5  → r ≈ 0.6 (Fast Relay / Lattice)
     - param ≈ 15.0 → r ≈ 0.0 (Zero Memory / Rewired)
     """
     decay_params = model.decay_params_out.detach().cpu().numpy()
@@ -238,11 +238,11 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     fig, ax = plt.subplots(figsize=(10, 6))
     bins = np.linspace(-0.5, 16.5, 200)
     
-    # Plot Hubs (Blue) - should peak near 0.0 (Infinite Memory)
+    # Plot Hubs (Blue)
     sns.histplot(decay_params[is_hub], color="blue", label="Hubs (Self-Pairs)", 
                  element="step", fill=True, alpha=0.3, bins=bins, ax=ax)
     
-    # Plot Non-Hubs (Orange) - bimodal: Lattice (~0.1) and Rewired (~15.0)
+    # Plot Non-Hubs (Orange)
     sns.histplot(decay_params[~is_hub], color="orange", label="Connections", 
                  element="step", fill=True, alpha=0.3, bins=bins, ax=ax)
     
@@ -257,14 +257,14 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     ylim = ax.get_ylim()
     text_y = 10**(np.log10(ylim[1]) * 0.85)
     
-    # Zone 1: Infinite Memory (Param ~ 0)
-    ax.axvline(x=0.05, color='blue', linestyle='--', alpha=0.3)
-    ax.text(0.1, text_y, "Infinite Memory\nr≈1.0\n(Hubs)", 
+    # Zone 1: Leaky Integrator (Param ~ 0.1)
+    ax.axvline(x=0.1, color='blue', linestyle='--', alpha=0.3)
+    ax.text(0.15, text_y, "Leaky Integrator\nr≈0.9\n(Hubs)", 
             ha='left', va='top', color='blue', fontsize=9, fontweight='bold')
 
-    # Zone 2: Working Memory (Param ~ 0.1)
-    ax.axvline(x=0.2, color='green', linestyle='--', alpha=0.3)
-    ax.text(0.5, text_y*0.5, "Working Memory\nr≈0.9\n(Lattice)", 
+    # Zone 2: Fast Relay (Param ~ 0.5)
+    ax.axvline(x=0.5, color='green', linestyle='--', alpha=0.3)
+    ax.text(0.55, text_y*0.5, "Fast Relay\nr≈0.6\n(Lattice)", 
             ha='left', va='top', color='green', fontsize=9, fontweight='bold')
 
     # Zone 3: Zero Memory (Param ~ 15)
@@ -312,7 +312,7 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     ax1.set_ylabel("Hub Neurons")
     
     sns.heatmap(nonhub_activity_sorted, ax=ax2, cmap="viridis", cbar=True, vmin=0, vmax=robust_max)
-    ax2.set_title("Connection Activity\n(Top = Infinite Memory/Lattice, Bottom = Zero Memory/Rewired)")
+    ax2.set_title("Connection Activity\n(Top = Fast Relay/Lattice, Bottom = Zero Memory/Rewired)")
     ax2.set_ylabel("Connections (Sorted by Param)")
     ax2.set_xlabel("Time Steps")
     
@@ -415,7 +415,7 @@ def visualize_topology_matrix(model, save_path="sw_matrix.png"):
     # Masks
     mask_self = (left == right)
     
-    # Lattice = Working Memory (Param ~ 0.1)
+    # Lattice = Fast Relay (Param ~ 0.5)
     # Filter: Not Self AND Param is Small (< 1.0)
     mask_lattice = (~mask_self) & (decays < 1.0)
     
@@ -425,17 +425,17 @@ def visualize_topology_matrix(model, save_path="sw_matrix.png"):
     
     plt.figure(figsize=(12, 12))
     
-    # Plot Rewired (Red/Blue) - Background
+    # Plot Rewired (Blue) - Background
     plt.scatter(left[mask_rewired], right[mask_rewired], 
                 c='blue', s=15, alpha=0.3, label='Rewired/Noise (Zero Mem)', marker='.')
                 
     # Plot Lattice (Green) - Foreground Band
     plt.scatter(left[mask_lattice], right[mask_lattice], 
-                c='green', s=20, alpha=0.8, label='Lattice (Working Mem)', marker='.')
+                c='green', s=20, alpha=0.8, label='Lattice (Fast Relay)', marker='.')
 
     # Plot Hubs (Dark Blue) - Spine
     plt.scatter(left[mask_self], right[mask_self], 
-                c='navy', s=50, alpha=1.0, label='Hubs (Infinite Mem)', marker='o')
+                c='navy', s=50, alpha=1.0, label='Hubs (Leaky Integrator)', marker='o')
 
     plt.title(f"Small-World Adjacency Matrix\n(d_model={d_model}, Edges={len(left)})")
     plt.xlabel("Source")
@@ -461,9 +461,9 @@ def get_edge_properties(s, t, decay_val, active_hubs):
     """
     Helper to classify edge types and weights based on memory horizon.
 
-    - Param 0.0  -> Hub (Infinite Mem)
-    - Param 0.1  -> Lattice (Working Mem)
-    - Param 15.0 -> Rewired (Zero Mem)
+    - Param ~0.1  -> Hub (Leaky Integrator)
+    - Param ~0.5  -> Lattice (Fast Relay)
+    - Param ~15.0 -> Rewired (Zero Memory)
     
     GEPHI PHYSICS (ForceAtlas2):
     - Weight determines attraction strength.
@@ -474,7 +474,7 @@ def get_edge_properties(s, t, decay_val, active_hubs):
 
     if s == t:
         # Hubs: Self-loops don't affect layout, but we mark them clearly
-        return "Hub (Infinite)", COLOR_HUB, 1.0 
+        return "Hub (Leaky)", COLOR_HUB, 1.0 
         
     elif decay_val > 10.0:
         # Zero Memory (High Param)
@@ -486,9 +486,9 @@ def get_edge_properties(s, t, decay_val, active_hubs):
             return "Noise", COLOR_NOISE, 0.1
             
     elif decay_val < 2.0:
-        # Param ~0.1 -> Lattice (Working Memory)
+        # Param ~0.5 -> Lattice (Fast Relay)
         # Visual: High weight (5.0) to force the nodes into the Ring topology
-        return "Lattice (Working)", COLOR_LATTICE, 5.0
+        return "Lattice (Relay)", COLOR_LATTICE, 5.0
         
     return "Unknown", "#FFFFFF", 0.1
 
