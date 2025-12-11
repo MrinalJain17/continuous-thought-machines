@@ -136,10 +136,6 @@ def test_lattice_invariant_deterministic(ctm_factory, base_params, device):
 def test_decay_initialization_priors(ctm_factory, base_params, device):
     """
     Property Test: Decay Initialization Hierarchy.
-    Verifies that parameters are initialized according to the 3-tier logic:
-    1. Self-Pair (Hubs) -> ~0.1 (Leaky Integrator / Stable Storage)
-    2. Lattice (Relay)  -> ~0.5 (Fast Diffusion / Relay)
-    3. Rewired (Pulse)  -> ~15.0 (Zero Memory / Teleportation)
     """
     d_model = 100
     n_synch = 500 
@@ -158,26 +154,38 @@ def test_decay_initialization_priors(ctm_factory, base_params, device):
     right = model.out_neuron_indices_right.cpu()
     decay_params = model.decay_params_out.detach().cpu()
     
-    # Verify Self-Pairs (Hubs)
-    # ~0.1 (Leaky). Allow small noise range [0.08, 0.12]
+    # Verify Self-Pairs (Hubs) ~ N(0.1, 0.02)
     self_mask = (left == right)
     self_decays = decay_params[self_mask]
-    assert torch.all((self_decays > 0.08) & (self_decays < 0.12)), f"Hubs must be Leaky Integrators (param ~ 0.1). Found mean: {self_decays.mean()}"
+    
+    # Check Mean (allow small drift)
+    assert 0.09 < self_decays.mean() < 0.11, \
+        f"Hub Mean drifted. Expected ~0.1, got {self_decays.mean():.4f}"
+        
+    # Check Variance (Standard Deviation)
+    assert 0.01 < self_decays.std() < 0.03, \
+        f"Hub Std deviation incorrect. Expected ~0.02, got {self_decays.std():.4f}"
 
     # Verify Others (Lattice vs Rewired)
     other_mask = ~self_mask
     other_decays = decay_params[other_mask]
     
-    # Check for Lattice Presence (Fast Relay)
-    # ~0.5. Range [0.4, 0.6] allows for noise variance.
-    has_lattice = torch.any((other_decays > 0.4) & (other_decays < 0.6))
+    # Separate Lattice (Low Param) from Rewired (High Param)
+    # Using < 2.0 is a safe threshold to capture the Lattice N(0.5, 0.1)
+    lattice_mask = (other_decays < 2.0)
+    lattice_decays = other_decays[lattice_mask]
+    
+    rewired_mask = (other_decays > 10.0)
+    rewired_decays = other_decays[rewired_mask]
 
-    # Check for Rewired Presence (Zero Memory)
-    # Param should be very high (15.0)
-    has_rewired = torch.any(other_decays > 10.0)
-
-    assert has_lattice, "Missing Lattice edges with Fast Relay decay (param ~ 0.5)"
-    assert has_rewired, "Missing Rewired edges with Zero Memory (param > 10.0)"
+    # Verify Lattice Stats ~ N(0.5, 0.1)
+    assert lattice_decays.numel() > 0, "No Lattice edges found"
+    assert 0.4 < lattice_decays.mean() < 0.6, \
+        f"Lattice Mean drifted. Expected ~0.5, got {lattice_decays.mean():.4f}"
+    
+    # Verify Rewired Stats ~ Fixed 15.0
+    assert rewired_decays.numel() > 0, "No Rewired edges found"
+    assert torch.all(rewired_decays > 14.0), "Rewired edges should be Zero Memory (>14.0)"
 
 
 # --- 4. Dynamic Safety Tests ---

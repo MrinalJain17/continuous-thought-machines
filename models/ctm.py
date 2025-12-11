@@ -558,7 +558,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         # This ensures high clustering and reachability within the 'Rich Club'.
         random_tgt_idx = torch.randint(0, num_hubs, flat_tgt_idx.shape, device=device)
         
-        # Handle self-loops in rewiring
+        # Handle collisions
         collisions = (random_tgt_idx == flat_src_idx)
         if collisions.any():
             random_tgt_idx[collisions] = torch.randint(0, num_hubs, (collisions.sum(),), device=device)
@@ -566,25 +566,24 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         # Apply Rewiring
         final_tgt_idx = torch.where(rand_mask, random_tgt_idx, flat_tgt_idx)
         
-        # Define Decay Types
-        # Note: We assign these here, then map to params later
+        # Define Decay Types: 0.0=Lattice, 1.0=Rewired
         decay_types = torch.where(rand_mask, 
-                                  torch.tensor(1.0, device=device),  # Rewired type
-                                  torch.tensor(0.0, device=device))  # Lattice type
+                                  torch.tensor(1.0, device=device),
+                                  torch.tensor(0.0, device=device))
 
         # --- MAP BACK TO REAL NEURON IDs ---
         
         # Self-Pairs
         all_left = hubs[self_src_idx]
         all_right = hubs[self_tgt_idx]
-        all_decay_types = torch.zeros(num_hubs, device=device) # Self type (0.0 placeholder)
+        all_decay_types = torch.zeros(num_hubs, device=device) # Type 0 (Self) placeholder
         
         # Neighbors
         all_left = torch.cat([all_left, hubs[flat_src_idx]])
         all_right = torch.cat([all_right, hubs[final_tgt_idx]])
         all_decay_types = torch.cat([all_decay_types, decay_types])
         
-        # --- FILL REMAINDER (BUDGET CLEANUP) ---
+        # --- FILL REMAINDER ---
         remainder = n_synch - all_left.size(0)
         if remainder > 0:
             # Connect random Hubs to random Neurons (Noise/Sampling)
@@ -613,20 +612,26 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         # param = 15.0 -> r = e^-15 ≈ 0.0 -> Forgets instantly
         PARAM_ZERO = 15.0
 
-        # Lattice (Local Neighbors) -> Fast Relay
-        decay_init = torch.full_like(all_decay_types, PARAM_LATTICE)
-        
-        # Rewired (Global Shortcuts) -> Zero Memory
-        decay_init[all_decay_types == 1.0] = PARAM_ZERO 
-        
-        # Noise (Remainder Edges) -> Zero Memory
+        decay_init = torch.zeros_like(all_decay_types)
+
+        # Lattice (Local Neighbors) -> Fast Relay -> Normal(0.5, 0.1)
+        # Rationale: Variance helps break symmetry for path learning
+        lattice_mask = (all_decay_types == 0.0)
+        decay_init[lattice_mask] = torch.normal(mean=PARAM_LATTICE, std=0.1, size=(lattice_mask.sum(),), device=device)
+
+        # Rewired (Global Shortcuts) -> Zero Memory -> Exact 15.0
+        decay_init[all_decay_types == 1.0] = PARAM_ZERO
+
+       # Noise (Remainder Edges) -> Zero Memory -> Exact 15.0
         decay_init[all_decay_types == 2.0] = PARAM_ZERO
-
-        # Add noise to allow learning diversity
-        decay_init += torch.randn_like(decay_init) * 0.01
-
-        # Hubs (Self-Pairs only) -> Leaky Integrator
-        decay_init[:num_hubs] = PARAM_HUBS
+        
+        # Hubs (Leaky Integrator) -> Normal(0.1, 0.02)
+        # Rationale: Variance prevents hypersynchrony
+        # Note: We overwrite the first num_hubs indices which correspond to self-pairs
+        decay_init[:num_hubs] = torch.normal(mean=PARAM_HUBS, std=0.02, size=(num_hubs,), device=device)
+        
+        # Clamp to ensure stability
+        decay_init = torch.clamp(decay_init, min=0.001)
         
         return all_left, all_right, decay_init
 

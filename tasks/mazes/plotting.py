@@ -236,7 +236,7 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     # PLOT 1: Topology Structure (Log-Scale Histogram)
     # =========================================================
     fig, ax = plt.subplots(figsize=(10, 6))
-    bins = np.linspace(-0.5, 16.5, 200)
+    bins = np.linspace(-0.5, 16.5, 1000)
     
     # Plot Hubs (Blue)
     sns.histplot(decay_params[is_hub], color="blue", label="Hubs (Self-Pairs)", 
