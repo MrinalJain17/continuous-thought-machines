@@ -547,16 +547,26 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         # --- REWIRING (FEEDER LINES) ---
         rand_mask = torch.rand(flat_src_idx.shape, device=device) < p
         
-        # Sources: Decouple from Hubs. Sample from GLOBAL input (d_model).
-        # Allows Periphery -> Core communication.
-        random_src_real = torch.randint(0, d_model, flat_src_idx.shape, device=device)
-        lattice_src_real = hubs[flat_src_idx]
-        final_src_real = torch.where(rand_mask, random_src_real, lattice_src_real)
-        
-        # Targets: Keep targeting HUBS.
-        # Ensures signal lands on an Integrator (Closed Core).
+        # Resolve Targets first (Hubs)
+        # We need the Real IDs to check for collisions later
         random_tgt_hub_idx = torch.randint(0, num_hubs, flat_tgt_idx.shape, device=device)
         final_tgt_hub_idx = torch.where(rand_mask, random_tgt_hub_idx, flat_tgt_idx)
+        final_tgt_real = hubs[final_tgt_hub_idx] # Map to Real IDs
+        
+        # Generate Sources (Global Input)
+        random_src_real = torch.randint(0, d_model, flat_src_idx.shape, device=device)
+        lattice_src_real = hubs[flat_src_idx]
+        
+        # Collision Avoidance
+        # If Random Source == Target Hub, shift Source by +1 to ensure it's a Feeder, not a Self-Loop
+        collision_mask = (random_src_real == final_tgt_real)
+        random_src_real = torch.where(
+            collision_mask, 
+            (random_src_real + 1) % d_model, 
+            random_src_real
+        )
+        
+        final_src_real = torch.where(rand_mask, random_src_real, lattice_src_real)
         
         # Decay Types: 0.0=Lattice, 1.0=Rewired
         decay_types = torch.where(rand_mask, 
@@ -571,8 +581,8 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         all_decay_types = torch.zeros(num_hubs, device=device)
         
         # Neighbors / Feeders
-        all_left = torch.cat([all_left, final_src_real])  # Already Real IDs
-        all_right = torch.cat([all_right, hubs[final_tgt_hub_idx]]) # Map Hub IDs to Real
+        all_left = torch.cat([all_left, final_src_real])
+        all_right = torch.cat([all_right, final_tgt_real])
         all_decay_types = torch.cat([all_decay_types, decay_types])
         
         # --- FILL REMAINDER ---
@@ -622,8 +632,11 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         
         # Hubs (Leaky Integrator) -> Normal(0.1, 0.02)
         # Rationale: Variance prevents hypersynchrony
-        # Note: We overwrite the first num_hubs indices which correspond to self-pairs
-        decay_init[:num_hubs] = torch.normal(mean=PARAM_HUBS, std=0.02, size=(num_hubs,), device=device)
+        # Since we prevented accidental self-loops in Feeders, we can safely assume 
+        # any remaining self-loops are indeed Hubs.
+        # But to be robust, we use a mask instead of slicing.
+        real_self_loops = (all_left == all_right)
+        decay_init[real_self_loops] = torch.normal(mean=PARAM_HUBS, std=0.02, size=(real_self_loops.sum(),), device=device)
         
         # Clamp to ensure stability
         decay_init = torch.clamp(decay_init, min=0.001)
