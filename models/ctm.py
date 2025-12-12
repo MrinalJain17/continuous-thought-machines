@@ -608,9 +608,9 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         # param = 0.5 -> r = e^-0.5 ≈ 0.60 -> Half-life ~1.4 steps
         PARAM_LATTICE = 0.5 
 
-        # Rewired (Zero Memory)
-        # param = 15.0 -> r = e^-15 ≈ 0.0 -> Forgets instantly
-        PARAM_ZERO = 15.0
+        # Rewired (Fast transmission)
+        # param = 3.0 -> r = e^-3 ≈ 0.05 -> Allows gradients to flow for ~1 steps.
+        PARAM_REWIRED = 3.0
 
         decay_init = torch.zeros_like(all_decay_types)
 
@@ -619,11 +619,14 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         lattice_mask = (all_decay_types == 0.0)
         decay_init[lattice_mask] = torch.normal(mean=PARAM_LATTICE, std=0.1, size=(lattice_mask.sum(),), device=device)
 
-        # Rewired (Global Shortcuts) -> Zero Memory -> Exact 15.0
-        decay_init[all_decay_types == 1.0] = PARAM_ZERO
+        # Rewired (Transmission) -> N(3.0, 0.2)
+        rewired_mask = (all_decay_types == 1.0)
+        decay_init[rewired_mask] = torch.normal(mean=PARAM_REWIRED, std=0.2, size=(rewired_mask.sum(),), device=device)
 
-       # Noise (Remainder Edges) -> Zero Memory -> Exact 15.0
-        decay_init[all_decay_types == 2.0] = PARAM_ZERO
+        # Noise (Remainder) -> N(3.0, 0.2)
+        # Treat noise same as rewired (Fast transmission)
+        noise_mask = (all_decay_types == 2.0)
+        decay_init[noise_mask] = torch.normal(mean=PARAM_REWIRED, std=0.2, size=(noise_mask.sum(),), device=device)
         
         # Hubs (Leaky Integrator) -> Normal(0.1, 0.02)
         # Rationale: Variance prevents hypersynchrony

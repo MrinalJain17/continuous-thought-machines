@@ -158,11 +158,8 @@ def test_decay_initialization_priors(ctm_factory, base_params, device):
     self_mask = (left == right)
     self_decays = decay_params[self_mask]
     
-    # Check Mean (allow small drift)
     assert 0.09 < self_decays.mean() < 0.11, \
         f"Hub Mean drifted. Expected ~0.1, got {self_decays.mean():.4f}"
-        
-    # Check Variance (Standard Deviation)
     assert 0.01 < self_decays.std() < 0.03, \
         f"Hub Std deviation incorrect. Expected ~0.02, got {self_decays.std():.4f}"
 
@@ -170,12 +167,12 @@ def test_decay_initialization_priors(ctm_factory, base_params, device):
     other_mask = ~self_mask
     other_decays = decay_params[other_mask]
     
-    # Separate Lattice (Low Param) from Rewired (High Param)
-    # Using < 2.0 is a safe threshold to capture the Lattice N(0.5, 0.1)
+    # Lattice Mask: < 2.0 (Captures the ~0.5 group)
     lattice_mask = (other_decays < 2.0)
     lattice_decays = other_decays[lattice_mask]
     
-    rewired_mask = (other_decays > 10.0)
+    # Rewired Mask: > 2.0 (Captures the ~3.0 group)
+    rewired_mask = (other_decays > 2.0)
     rewired_decays = other_decays[rewired_mask]
 
     # Verify Lattice Stats ~ N(0.5, 0.1)
@@ -183,9 +180,14 @@ def test_decay_initialization_priors(ctm_factory, base_params, device):
     assert 0.4 < lattice_decays.mean() < 0.6, \
         f"Lattice Mean drifted. Expected ~0.5, got {lattice_decays.mean():.4f}"
     
-    # Verify Rewired Stats ~ Fixed 15.0
+    # Verify Rewired Stats ~ N(3.0, 0.2)
     assert rewired_decays.numel() > 0, "No Rewired edges found"
-    assert torch.all(rewired_decays > 14.0), "Rewired edges should be Zero Memory (>14.0)"
+    assert 2.8 < rewired_decays.mean() < 3.2, \
+        f"Rewired Mean drifted. Expected ~3.0 (Transmission), got {rewired_decays.mean():.4f}"
+    
+    # Optional: Check limits to ensure no extreme outliers
+    assert torch.all((rewired_decays > 2.0) & (rewired_decays < 4.0)), \
+        "Rewired edges leaked outside safe Transmission range (2.0 - 4.0)"
 
 
 # --- 4. Dynamic Safety Tests ---

@@ -225,7 +225,7 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     r = exp(-decay_param)
     - param ≈ 0.1  → r ≈ 0.9 (Leaky Integrator / Hubs)
     - param ≈ 0.5  → r ≈ 0.6 (Fast Relay / Lattice)
-    - param ≈ 15.0 → r ≈ 0.0 (Zero Memory / Rewired)
+    - param ≈ 3.0  → r ≈ 0.05 (Fast Transmission / Rewired)
     """
     decay_params = model.decay_params_out.detach().cpu().numpy()
     left = model.out_neuron_indices_left.cpu().numpy()
@@ -267,10 +267,10 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     ax.text(0.55, text_y*0.5, "Fast Relay\nr≈0.6\n(Lattice)", 
             ha='left', va='top', color='green', fontsize=9, fontweight='bold')
 
-    # Zone 3: Zero Memory (Param ~ 15)
-    ax.axvline(x=14.0, color='red', linestyle='--', alpha=0.3)
-    ax.text(14.5, text_y, "Zero Memory\nr≈0.0\n(Rewired)", 
-            ha='right', va='top', color='red', fontsize=9, fontweight='bold')
+    # Zone 3: Fast Transmission (Param ~ 3.0)
+    ax.axvline(x=3.0, color='cyan', linestyle='--', alpha=0.3)
+    ax.text(3.1, text_y, "Transmission\nr≈0.05\n(Rewired)", 
+            ha='left', va='top', color='cyan', fontsize=9, fontweight='bold')
     
     ax.set_title(f"Small-World Topology at Step {step_num}\n(Decay Parameter Distribution)")
     ax.set_xlabel("Decay Parameter p (r = e^-p)")
@@ -293,8 +293,6 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     nonhub_decays = decay_params[~is_hub]
     
     # Sort non-hubs by decay_param (Low -> High)
-    # Low Param = Infinite Memory (Top of list)
-    # High Param = Zero Memory (Bottom of list)
     sort_indices = np.argsort(nonhub_decays)
     nonhub_activity_sorted = nonhub_activity[sort_indices, :]
     
@@ -312,7 +310,7 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     ax1.set_ylabel("Hub Neurons")
     
     sns.heatmap(nonhub_activity_sorted, ax=ax2, cmap="viridis", cbar=True, vmin=0, vmax=robust_max)
-    ax2.set_title("Connection Activity\n(Top = Fast Relay/Lattice, Bottom = Zero Memory/Rewired)")
+    ax2.set_title("Connection Activity\n(Top = Fast Relay/Lattice, Bottom = Transmission/Rewired)")
     ax2.set_ylabel("Connections (Sorted by Param)")
     ax2.set_xlabel("Time Steps")
     
@@ -416,18 +414,18 @@ def visualize_topology_matrix(model, save_path="sw_matrix.png"):
     mask_self = (left == right)
     
     # Lattice = Fast Relay (Param ~ 0.5)
-    # Filter: Not Self AND Param is Small (< 1.0)
-    mask_lattice = (~mask_self) & (decays < 1.0)
+    # Filter: Not Self AND Param is Small (< 2.0)
+    mask_lattice = (~mask_self) & (decays < 2.0)
     
-    # Rewired/Noise = Zero Memory (Param ~ 15.0)
-    # Filter: Not Self AND Param is Large (> 10.0)
-    mask_rewired = (~mask_self) & (decays > 10.0)
+    # Rewired/Noise = Fast Transmission (Param ~ 3.0)
+    # Filter: Not Self AND Param is Large (> 2.0)
+    mask_rewired = (~mask_self) & (decays >= 2.0)
     
     plt.figure(figsize=(12, 12))
     
     # Plot Rewired (Blue) - Background
     plt.scatter(left[mask_rewired], right[mask_rewired], 
-                c='blue', s=15, alpha=0.3, label='Rewired/Noise (Zero Mem)', marker='.')
+                c='blue', s=15, alpha=0.3, label='Rewired/Noise (Transmission)', marker='.')
                 
     # Plot Lattice (Green) - Foreground Band
     plt.scatter(left[mask_lattice], right[mask_lattice], 
@@ -461,33 +459,27 @@ def get_edge_properties(s, t, decay_val, active_hubs):
     """
     Helper to classify edge types and weights based on memory horizon.
 
-    - Param ~0.1  -> Hub (Leaky Integrator)
-    - Param ~0.5  -> Lattice (Fast Relay)
-    - Param ~15.0 -> Rewired (Zero Memory)
-    
-    GEPHI PHYSICS (ForceAtlas2):
-    - Weight determines attraction strength.
-    - We want the LATTICE (Ring) to define the shape -> High Weight.
-    - We want REWIRED to be visible shortcuts but not crush the ring -> Lower Weight.
+    - Param ~0.1 -> Hub (Storage / Leaky Integrator)
+    - Param ~0.5 -> Lattice (Relay / Short-Term Context)
+    - Param ~3.0 -> Rewired (Transmission / Impulse)
     """
     decay_val = float(decay_val)
 
     if s == t:
-        # Hubs: Self-loops don't affect layout, but we mark them clearly
-        return "Hub (Leaky)", COLOR_HUB, 1.0 
+        # Hubs: Self-loops
+        return "Hub (Storage)", COLOR_HUB, 1.0 
         
-    elif decay_val > 10.0:
-        # Zero Memory (High Param)
+    elif decay_val > 2.0:
+        # Fast Transmission (Param ~ 3.0)
+        # We use > 2.0 to safely capture the N(3.0, 0.2) distribution
         if t in active_hubs:
-            # Connects two Hubs = Global Shortcut
-            return "Rewired (Global)", COLOR_REWIRED, 1.0
+            return "Rewired (Transmission)", COLOR_REWIRED, 1.0
         else:
-            # Connects Hub to Passive Neuron = Noise
             return "Noise", COLOR_NOISE, 0.1
             
-    elif decay_val < 2.0:
-        # Param ~0.5 -> Lattice (Fast Relay)
-        # Visual: High weight (5.0) to force the nodes into the Ring topology
+    elif decay_val <= 2.0:
+        # Fast Relay (Param ~ 0.5)
+        # Visual: High weight (5.0) to force Gephi to show the Ring
         return "Lattice (Relay)", COLOR_LATTICE, 5.0
         
     return "Unknown", "#FFFFFF", 0.1
