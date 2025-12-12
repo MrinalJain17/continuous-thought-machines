@@ -236,7 +236,7 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     # PLOT 1: Topology Structure (Log-Scale Histogram)
     # =========================================================
     fig, ax = plt.subplots(figsize=(10, 6))
-    bins = np.linspace(-0.5, 16.5, 1000)
+    bins = np.linspace(-0.5, 5.5, 1000)
     
     # Plot Hubs (Blue)
     sns.histplot(decay_params[is_hub], color="blue", label="Hubs (Self-Pairs)", 
@@ -251,7 +251,7 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     sns.histplot(decay_params[~is_hub], color="orange", element="step", fill=False, lw=2, bins=bins, ax=ax)
     
     ax.set_yscale('log')
-    ax.set_xlim(-0.5, 16.5)
+    ax.set_xlim(-0.5, 5.5)
     
     # Reference Lines & Labels
     ylim = ax.get_ylim()
@@ -493,8 +493,9 @@ def export_full_network(model, save_path="sw_full_network.graphml"):
     right = model.out_neuron_indices_right.cpu().numpy()
     decays = model.decay_params_out.detach().cpu().numpy()
     
-    # Identify Active Hubs (Neurons that have outgoing connections)
-    active_hubs = set(np.unique(left))
+    # Identify Real Hubs via Self-Loops
+    # Only neurons with i->i connections are state-maintaining Hubs.
+    active_hubs = set(left[left == right])
     
     G = nx.DiGraph()
     
@@ -502,17 +503,22 @@ def export_full_network(model, save_path="sw_full_network.graphml"):
         s, t = int(s), int(t)
         category, color, weight = get_edge_properties(s, t, d, active_hubs)
         
-        # Sizing: Hubs are large anchors
-        s_size = 30.0
-        t_size = 30.0 if t in active_hubs else 10.0
-        
-        G.add_node(s, label=f"Neuron {s}", Category="Hub", Size=s_size, Color=COLOR_HUB)
+        # Source Node 's'
+        if s in active_hubs:
+            cat_s, col_s, size_s = "Hub", COLOR_HUB, 30.0
+        else:
+            # If s is not in active_hubs, it is a Sensory Input (Periphery)
+            cat_s, col_s, size_s = "Sensory", "#AAAAAA", 10.0 # Grey for raw input
+        G.add_node(s, label=f"Neuron {s}", Category=cat_s, Size=size_s, Color=col_s)
+
+        # Target Node 't'
         if not G.has_node(t):
-            # Target might not be a source (Hub), so we label it Neighbor
-            cat = "Hub" if t in active_hubs else "Neighbor"
-            col = COLOR_HUB if t in active_hubs else COLOR_LATTICE
-            G.add_node(t, label=f"Neuron {t}", Category=cat, Size=t_size, Color=col)
-            
+            if t in active_hubs:
+                cat_t, col_t, size_t = "Hub", COLOR_HUB, 30.0
+            else:
+                cat_t, col_t, size_t = "Neighbor", COLOR_LATTICE, 10.0
+            G.add_node(t, label=f"Neuron {t}", Category=cat_t, Size=size_t, Color=col_t)
+
         G.add_edge(s, t, weight=weight, Type=category, Color=color, Param=float(d))
         
     nx.write_graphml(G, save_path)

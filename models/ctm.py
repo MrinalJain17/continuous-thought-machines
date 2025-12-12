@@ -497,10 +497,9 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         Generates indices for a Small-World topology (Watts-Strogatz).
         
         Logic:
-        1. Calculate 'cost per hub': 1 (self-pair) + k (neighbors).
-        2. Determine max hubs affordable: n_synch // cost.
-        3. Select hubs using linspace to maximize coverage of the d_model space.
-        4. Wire hubs to themselves (energy) and neighbors (mixing).
+        1. Hubs form a Lattice Backbone (Ring).
+        2. Rewired edges become 'Feeder Lines': Random Input -> Hub.
+        This allows the Core to see global features without leaking state.
         """
         device = self.start_activated_state.device
         
@@ -519,7 +518,6 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             decay_init = torch.zeros(n_synch, device=device)
             return left, right, decay_init
 
-        # --- PATH B: Small-World Generation ---
         # Identify Hub Neurons (spaced evenly across d_model)
         # e.g., [0, 20, 40, ...]
         hubs = torch.linspace(0, d_model - 1, steps=num_hubs).long().to(device)
@@ -539,48 +537,42 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             -torch.arange(1, neighbors_per_side + 1, device=device)
         ])
         
-        # Calculate Targets in Hub Space (Ring Topology via Modulo)
-        # Shape: (num_hubs, k)
+        # Neighbors (in Hub Index Space)
         neighbor_tgt_idx = (hub_indices.unsqueeze(1) + offsets.unsqueeze(0)) % num_hubs
         neighbor_src_idx = hub_indices.unsqueeze(1).expand(-1, actual_k)
         
-        # Flatten
         flat_src_idx = neighbor_src_idx.reshape(-1)
         flat_tgt_idx = neighbor_tgt_idx.reshape(-1)
         
-        # --- REWIRING (SHORTCUTS) ---
-        
-        # Mask for rewiring
+        # --- REWIRING (FEEDER LINES) ---
         rand_mask = torch.rand(flat_src_idx.shape, device=device) < p
         
-        # Generate Random Targets (Shortcuts)
-        # Shortcuts should also target *Hubs* to keep the backbone closed.
-        # This ensures high clustering and reachability within the 'Rich Club'.
-        random_tgt_idx = torch.randint(0, num_hubs, flat_tgt_idx.shape, device=device)
+        # Sources: Decouple from Hubs. Sample from GLOBAL input (d_model).
+        # Allows Periphery -> Core communication.
+        random_src_real = torch.randint(0, d_model, flat_src_idx.shape, device=device)
+        lattice_src_real = hubs[flat_src_idx]
+        final_src_real = torch.where(rand_mask, random_src_real, lattice_src_real)
         
-        # Handle collisions
-        collisions = (random_tgt_idx == flat_src_idx)
-        if collisions.any():
-            random_tgt_idx[collisions] = torch.randint(0, num_hubs, (collisions.sum(),), device=device)
-            
-        # Apply Rewiring
-        final_tgt_idx = torch.where(rand_mask, random_tgt_idx, flat_tgt_idx)
+        # Targets: Keep targeting HUBS.
+        # Ensures signal lands on an Integrator (Closed Core).
+        random_tgt_hub_idx = torch.randint(0, num_hubs, flat_tgt_idx.shape, device=device)
+        final_tgt_hub_idx = torch.where(rand_mask, random_tgt_hub_idx, flat_tgt_idx)
         
-        # Define Decay Types: 0.0=Lattice, 1.0=Rewired
+        # Decay Types: 0.0=Lattice, 1.0=Rewired
         decay_types = torch.where(rand_mask, 
                                   torch.tensor(1.0, device=device),
                                   torch.tensor(0.0, device=device))
 
         # --- MAP BACK TO REAL NEURON IDs ---
         
-        # Self-Pairs
+        # Self-Pairs (Hubs)
         all_left = hubs[self_src_idx]
         all_right = hubs[self_tgt_idx]
-        all_decay_types = torch.zeros(num_hubs, device=device) # Type 0 (Self) placeholder
+        all_decay_types = torch.zeros(num_hubs, device=device)
         
-        # Neighbors
-        all_left = torch.cat([all_left, hubs[flat_src_idx]])
-        all_right = torch.cat([all_right, hubs[final_tgt_idx]])
+        # Neighbors / Feeders
+        all_left = torch.cat([all_left, final_src_real])  # Already Real IDs
+        all_right = torch.cat([all_right, hubs[final_tgt_hub_idx]]) # Map Hub IDs to Real
         all_decay_types = torch.cat([all_decay_types, decay_types])
         
         # --- FILL REMAINDER ---
@@ -619,7 +611,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         lattice_mask = (all_decay_types == 0.0)
         decay_init[lattice_mask] = torch.normal(mean=PARAM_LATTICE, std=0.1, size=(lattice_mask.sum(),), device=device)
 
-        # Rewired (Transmission) -> N(3.0, 0.2)
+        # Rewired (Feeders) ~ N(3.0, 0.2)
         rewired_mask = (all_decay_types == 1.0)
         decay_init[rewired_mask] = torch.normal(mean=PARAM_REWIRED, std=0.2, size=(rewired_mask.sum(),), device=device)
 

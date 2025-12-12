@@ -51,16 +51,17 @@ def test_small_world_task_configs(ctm_factory, base_params, device, config):
     assert left.shape[0] == config["n_synch"]
     
     # 2. Hub Count Check
-    # We identify "Hubs" as unique source neurons in the 'left' tensor
-    unique_hubs = torch.unique(left)
+    # We define a "Structural Hub" as a node that is the TARGET of connections.
+    # In Centralized Integration, all roads lead to Hubs.
+    unique_hub_targets = torch.unique(right)
     
     # Note: If remainder filling occurs, we might have slightly more unique sources.
     # But we must have AT LEAST the expected number of structured hubs.
-    assert len(unique_hubs) >= config["expected_hubs"]
+    assert len(unique_hub_targets) >= config["expected_hubs"]
     # It shouldn't be exploding (e.g. random pairing would give ~n_synch unique sources)
     # For Maze: 32 hubs. Random would be ~800. This verifies structure.
     if config["name"] == "Maze_39x39":
-        assert len(unique_hubs) < 100, "Maze topology should be sparse (Hub-and-Spoke), not random."
+        assert len(unique_hub_targets) < 100, "Maze topology should be sparse (Hub-and-Spoke), not random."
 
     # 3. Energy Constraint Check (Self-Pairing)
     # Every identified Hub MUST have a self-connection (i,i)
