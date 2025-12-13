@@ -633,7 +633,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         # Hubs (Leaky Integrator) -> LogNormal(-2.3, 1.0)
         # Rationale: Variance prevents hypersynchrony
         real_self_loops = (all_left == all_right)
-        raw_decay = torch.distributions.LogNormal(np.log(PARAM_HUBS), 1.0).sample((n_hubs,)).to(device)
+        raw_decay = torch.distributions.LogNormal(np.log(PARAM_HUBS), 1.0).sample((real_self_loops.sum(),)).to(device)
         raw_decay = torch.clamp(raw_decay, min=0.001, max=0.3)
         decay_init[real_self_loops] = raw_decay
         
