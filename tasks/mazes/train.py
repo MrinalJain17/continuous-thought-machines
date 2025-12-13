@@ -7,7 +7,7 @@ from rich.live import Live
 from rich.table import Table
 from rich.panel import Panel
 from rich.layout import Layout
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -468,6 +468,8 @@ if __name__=='__main__':
         SpinnerColumn(),
         BarColumn(),
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
     )
     task_id = job_progress.add_task("[green]Training...", total=args.training_iterations)
     iterator = iter(trainloader)
