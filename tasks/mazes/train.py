@@ -96,7 +96,11 @@ def make_dashboard(iter_num, total_iters, loss, acc, grad_stats, vitals_stats, o
     vitals_content = (
         f"Energy: [bold]{vitals_stats.get('energy', 0.0):.4f}[/]\n"
         f"Dead:   [red]{vitals_stats.get('dead', 0.0):.1f}%[/]\n"
-        f"Rank:   [cyan]{vitals_stats.get('rank', 0.0):.1f}[/]"
+        f"Rank:   [cyan]{vitals_stats.get('rank', 0.0):.1f}[/]\n"
+        f"[dim]──────────────[/]\n"
+        f"r(Self): {vitals_stats.get('r_self', 0.0):.2f}\n"
+        f"r(Lat):  [bold yellow]{vitals_stats.get('r_latt', 0.0):.2f}[/]\n"
+        f"r(Feed): {vitals_stats.get('r_feed', 0.0):.2f}"
     )
     vitals_panel = Panel(vitals_content, title="Core Vitals", border_style="red")
 
@@ -797,30 +801,32 @@ if __name__=='__main__':
                                 left = model.out_neuron_indices_left.detach().cpu().numpy()
                                 right = model.out_neuron_indices_right.detach().cpu().numpy()
                                 activity_np = synch_out_viz
-                                self_loop_edge_mask = (left == right)
 
+                                # Identify Topologies
+                                unique_hubs = np.unique(right)
+                                is_source_hub = np.isin(left, unique_hubs)
+                                mask_self = (left == right)                 # Hub Memory
+                                mask_lattice = is_source_hub & (~mask_self) # Ring Backbone
+                                mask_feeder = ~is_source_hub                # Sensory Input
+
+                                # Visualizations
                                 visualize_small_world_diagnostics(model, synch_out_viz, f"{args.log_dir}/sw_diagnostics/sw", bi)
                                 visualize_evolution_metrics(model, synch_out_viz, f'{args.log_dir}/sw_evolution.png')
-                                if self_loop_edge_mask.any():
-                                    plot_hub_correlation(activity_np, self_loop_edge_mask, f"{args.log_dir}/sw_diagnostics/sw", bi)
-                                    raw_activity = activity_np[:, :, self_loop_edge_mask] 
-                                    label = "Hub"
+                                
+                                if mask_self.any():
+                                    plot_hub_correlation(activity_np, mask_self, f"{args.log_dir}/sw_diagnostics/sw", bi)
+                                    raw_activity = activity_np[:, :, mask_self] # Focus Vitals on Core
                                 else:
-                                    raw_activity = activity_np
-                                    label = "Global"
+                                    raw_activity = activity_np # Fallback
 
-                                # --- VITAL SIGN 1: ENERGY & DEATH ---
-                                # Average over Batch (0) and Time (1) to get per-neuron stats
-                                mean_neuron_activity = np.abs(raw_activity).mean(axis=(0, 1)) # (Hubs,)
+                                # Calculate Vitals & Risks
+                                # A. Energy/Death
+                                mean_neuron_activity = np.abs(raw_activity).mean(axis=(0, 1))
                                 hub_energy = mean_neuron_activity.mean()
                                 dead_pct = (mean_neuron_activity < 1e-6).mean() * 100
-
-                                # --- VITAL SIGN 2: EFFECTIVE RANK ---
-                                # Goal: Check if the BATCH items are distinct.
-                                # We collapse TIME (axis 1), preserving BATCH (axis 0)
-                                # Result: (Batch, Hubs) - "What was the average thought of this hub for this image?"
-                                batch_activity = np.abs(raw_activity).mean(axis=1) 
                                 
+                                # B. Effective Rank (The Blob Check)
+                                batch_activity = np.abs(raw_activity).mean(axis=1) 
                                 try:
                                     _, S_val, _ = np.linalg.svd(batch_activity)
                                     sing_vals = S_val / (S_val.sum() + 1e-9)
@@ -828,10 +834,18 @@ if __name__=='__main__':
                                 except:
                                     effective_rank = 0.0
 
-                                # Dashboard
+                                # C. Granular Decay Rates (Latency Risk Check)
+                                r_self = decay[mask_self].mean() if mask_self.any() else 0.0
+                                r_latt = decay[mask_lattice].mean() if mask_lattice.any() else 0.0
+                                r_feed = decay[mask_feeder].mean() if mask_feeder.any() else 0.0
+
+                                # Update State for Dashboard
                                 vitals_stats['energy'] = hub_energy
                                 vitals_stats['dead'] = dead_pct
                                 vitals_stats['rank'] = effective_rank
+                                vitals_stats['r_self'] = r_self
+                                vitals_stats['r_latt'] = r_latt
+                                vitals_stats['r_feed'] = r_feed
                         #  except Exception as e:
                         #       print(f"Visualization failed for model {args.model}: {e}")
                     # --- End Visualization ---
