@@ -457,7 +457,10 @@ if __name__=='__main__':
 
     # Training
     grad_stats = {'hubs': 0.0, 'feeders': 0.0}
-    vitals_stats = {'energy': 0.0, 'dead': 0.0, 'rank': 0.0}
+    vitals_stats = {'energy': 0.0, 'dead': 0.0, 'rank': 0.0, 'r_self': 0.0, 'r_latt': 0.0, 'r_feed': 0.0}
+    optim_stats = {'lr': 0.0, 'gu': -1.0, 'gc': 0.0}
+    task_stats = {} # Will be populated dynamically
+    
     current_loss = 0.0
     current_acc = 0.0
     job_progress = Progress(
@@ -861,7 +864,10 @@ if __name__=='__main__':
             live.update(make_dashboard(
                 bi, args.training_iterations, 
                 current_loss, current_acc, 
-                grad_stats, vitals_stats, 
+                grad_stats, 
+                vitals_stats, 
+                optim_stats, 
+                task_stats, 
                 job_progress
             ))
 
