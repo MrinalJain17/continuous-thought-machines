@@ -2,6 +2,13 @@ import argparse
 import os
 import random
 
+from rich.console import Console
+from rich.live import Live
+from rich.table import Table
+from rich.panel import Panel
+from rich.layout import Layout
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn
+
 import matplotlib.pyplot as plt
 import numpy as np
 import seaborn as sns
@@ -10,20 +17,21 @@ import torch
 if torch.cuda.is_available():
     # For faster
     torch.set_float32_matmul_precision('high')
-from tqdm.auto import tqdm
 
 from data.custom_datasets import MazeImageFolder
 from models.ctm import ContinuousThoughtMachine
 from models.lstm import LSTMBaseline
 from models.ff import FFBaseline
-from tasks.mazes.plotting import make_maze_gif, visualize_small_world_diagnostics, visualize_topology_matrix, export_full_network, visualize_evolution_metrics
+from tasks.mazes.plotting import make_maze_gif, visualize_small_world_diagnostics, visualize_topology_matrix, export_full_network, visualize_evolution_metrics, plot_hub_correlation
 from tasks.image_classification.plotting import plot_neural_dynamics 
 from utils.housekeeping import set_seed, zip_python_code
 from utils.losses import maze_loss 
 from utils.schedulers import WarmupCosineAnnealingLR, WarmupMultiStepLR, warmup
 
 import torchvision
+
 torchvision.disable_beta_transforms_warning()
+console = Console()
 
 import warnings
 warnings.filterwarnings("ignore", message="using precomputed metric; inverse_transform will be unavailable")
@@ -46,6 +54,65 @@ warnings.filterwarnings(
     UserWarning,
     r"^PIL\.TiffImagePlugin$" # Using a regular expression to match the module.
 )
+
+
+def make_dashboard(iter_num, total_iters, loss, acc, grad_stats, vitals_stats, optim_stats, task_stats, pbar):
+    """Constructs the Live Dashboard"""
+    # Main Status Table
+    status_table = Table.grid(padding=(0, 2))
+    status_table.add_column(style="bold cyan", justify="right")
+    status_table.add_column(style="magenta")
+    
+    # Core Training
+    status_table.add_row("Iteration", f"{iter_num}/{total_iters}")
+    status_table.add_row("Loss", f"{loss:.4f}")
+    status_table.add_row("Accuracy", f"{acc:.4f}")
+    status_table.add_row("LR", f"{optim_stats.get('lr', 0.0):.6f}")
+    
+    # Gradient Norms (Unclipped / Clipped)
+    gu = optim_stats.get('gu', -1.0)
+    gc = optim_stats.get('gc', 0.0)
+    grad_str = f"GU:{gu:.2f} GC:{gc:.2f}" if gu != -1 else f"G:{gc:.2f}"
+    status_table.add_row("Gradients", grad_str)
+
+    # Task Stats (Time T and Length L)
+    if 't_val' in task_stats:
+        t_str = f"µ{task_stats['t_val']:.1f}±{task_stats['t_std']:.1f} [{task_stats['t_min']}-{task_stats['t_max']}]"
+        status_table.add_row("Time (T)", t_str)
+    
+    if 'l_mean' in task_stats:
+        l_str = f"µ{task_stats['l_mean']:.1f}±{task_stats['l_std']:.1f} [{task_stats['l_min']}-{task_stats['l_max']}]"
+        status_table.add_row("Len (L)", l_str)
+    
+    # Gradient Pulse Panel (Feeder Check)
+    grad_panel = Panel(
+        f"Hubs:    [green]{grad_stats.get('hubs', 0.0):.5f}[/]\n"
+        f"Feeders: [yellow]{grad_stats.get('feeders', 0.0):.5f}[/]",
+        title="Topology Grads",
+        border_style="blue"
+    )
+
+    # Vital Signs Panel (The Blob Check)
+    vitals_content = (
+        f"Energy: [bold]{vitals_stats.get('energy', 0.0):.4f}[/]\n"
+        f"Dead:   [red]{vitals_stats.get('dead', 0.0):.1f}%[/]\n"
+        f"Rank:   [cyan]{vitals_stats.get('rank', 0.0):.1f}[/]"
+    )
+    vitals_panel = Panel(vitals_content, title="Core Vitals", border_style="red")
+
+    # Layout
+    layout = Layout()
+    layout.split_column(
+        Layout(name="upper", ratio=1),
+        Layout(pbar)
+    )
+    layout["upper"].split_row(
+        Layout(Panel(status_table, title="Training Stats"), ratio=1),
+        Layout(grad_panel, ratio=1),
+        Layout(vitals_panel, ratio=1)
+    )
+
+    return layout
 
 
 def parse_args():
@@ -385,10 +452,21 @@ if __name__=='__main__':
         )
 
     # Training
+    grad_stats = {'hubs': 0.0, 'feeders': 0.0}
+    vitals_stats = {'energy': 0.0, 'dead': 0.0, 'rank': 0.0}
+    current_loss = 0.0
+    current_acc = 0.0
+    job_progress = Progress(
+        "{task.description}",
+        SpinnerColumn(),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+    )
+    task_id = job_progress.add_task("[green]Training...", total=args.training_iterations)
     iterator = iter(trainloader)
-    with tqdm(total=args.training_iterations, initial=start_iter, leave=False, position=0, dynamic_ncols=True) as pbar:
+    with Live(refresh_per_second=4) as live:
         for bi in range(start_iter, args.training_iterations):
-            current_lr = optimizer.param_groups[-1]['lr']
+            optim_stats['lr'] = optimizer.param_groups[-1]['lr']
 
             try:
                 inputs, targets = next(iterator)
@@ -449,37 +527,40 @@ if __name__=='__main__':
 
                 # Extract stats from loss outputs if they are tensors
                 if torch.is_tensor(where_most_certain):
-                    where_most_certain_val = where_most_certain.float().mean().item()
-                    where_most_certain_std = where_most_certain.float().std().item()
-                    where_most_certain_min = where_most_certain.min().item()
-                    where_most_certain_max = where_most_certain.max().item()
-                elif isinstance(where_most_certain, int): # Handle case where it might return -1 directly
-                     where_most_certain_val = float(where_most_certain)
-                     where_most_certain_min = where_most_certain
-                     where_most_certain_max = where_most_certain
+                    task_stats['t_val'] = where_most_certain.float().mean().item()
+                    task_stats['t_std'] = where_most_certain.float().std().item()
+                    task_stats['t_min'] = where_most_certain.min().item()
+                    task_stats['t_max'] = where_most_certain.max().item()
 
-                if isinstance(upto_where, (np.ndarray, list)) and len(upto_where) > 0: # Check if it's a list/array
-                    upto_where_mean = np.mean(upto_where)
-                    upto_where_std = np.std(upto_where)
-                    upto_where_min = np.min(upto_where)
-                    upto_where_max = np.max(upto_where)
+                if isinstance(upto_where, (np.ndarray, list)) and len(upto_where) > 0:
+                    task_stats['l_mean'] = np.mean(upto_where)
+                    task_stats['l_std'] = np.std(upto_where)
+                    task_stats['l_min'] = np.min(upto_where)
+                    task_stats['l_max'] = np.max(upto_where)
 
 
             scaler.scale(loss).backward()
 
-            unclipped_norm_for_log = -1.0
-            if args.gradient_clipping!=-1: 
+            # --- Gradient Pulse  ---
+            # Assessing if Feeder Lines (p=3.0) are receiving credit or vanishing.
+            if bi % 100 == 0:
+                with torch.no_grad():
+                    if hasattr(model, 'decay_params_out') and model.decay_params_out.grad is not None:
+                        d_params = model.decay_params_out.grad
+                        left = model.out_neuron_indices_left
+                        right = model.out_neuron_indices_right
+                        is_hub = (left == right)
+                        grad_stats['hubs'] = d_params[is_hub].norm().item()
+                        grad_stats['feeders'] = d_params[~is_hub].norm().item()
+
+            optim_stats['gu'] = -1.0
+            if args.gradient_clipping != -1:
                 scaler.unscale_(optimizer)
-                # --- Monitor Unclipped Gradient ---
                 unclipped_norm = 0.0
                 for p in model.parameters():
                     if p.grad is not None:
-                        # Sum of squares of unscaled gradients
                         unclipped_norm += p.grad.detach().data.norm(2).item() ** 2
-                
-                unclipped_norm_for_log = unclipped_norm ** 0.5
-
-                # Apply clipping to the raw gradients
+                optim_stats['gu'] = unclipped_norm ** 0.5
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.gradient_clipping)
 
             scaler.step(optimizer)
@@ -489,39 +570,16 @@ if __name__=='__main__':
             for p in model.parameters():
                 if p.grad is not None:
                     grad_norm += p.grad.detach().data.norm(2).item() ** 2
-            grad_norm = grad_norm ** 0.5
+            optim_stats['gc'] = grad_norm ** 0.5
 
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
 
-            # Conditional Tqdm Description
-            pbar_desc = f'L={loss.item():0.3f} Acc={accuracy_finegrained:0.3f}'
-            
-            if args.gradient_clipping!=-1:
-                log_grad = f' GU:{unclipped_norm_for_log:.2f} GC:{grad_norm:.2f}'
-            else:
-                log_grad = f' G:{grad_norm:.2f}'
-            
-            pbar_desc += log_grad + f' LR={current_lr:0.6f}'
-
-            if args.model in ['ctm', 'lstm'] or torch.is_tensor(where_most_certain): # Show stats if available
-                 # T=Tick Time. Formatted as: T: µ=Mean ±Std [Min-Max]
-                 pbar_desc += f' | T: µ{where_most_certain_val:0.1f}±{where_most_certain_std:0.1f} [{where_most_certain_min:d}-{where_most_certain_max:d}]'
-            if isinstance(upto_where, (np.ndarray, list)) and len(upto_where) > 0:
-                 # L=Path Length. Formatted as: L: µ=Mean ±Std [Min-Max]
-                 pbar_desc += f' | L: µ{upto_where_mean:0.1f}±{upto_where_std:0.1f} [{upto_where_min:d}-{upto_where_max:d}]'
-
-            pbar.set_description(pbar_desc)
-
-
             # Metrics tracking and plotting
             if bi%args.track_every==0 and (bi != 0 or args.reload_model_only):
                 model.eval() # Use eval mode for consistency during tracking
                 with torch.inference_mode(): # Use inference mode for tracking
-
-                    
-
 
                     # --- Quantitative Metrics ---
                     iters.append(bi)
@@ -536,13 +594,11 @@ if __name__=='__main__':
                     current_test_accuracies_most_certain_permaze_eval = []
 
                     # TRAIN METRICS
-                    pbar.set_description('Tracking: Computing TRAIN metrics')
                     all_targets_list = []
                     all_predictions_list = [] # Per step/tick predictions argmax (N, S, T) or (N, S)
                     all_predictions_most_certain_list = [] # Predictions at chosen step/tick argmax (N, S)
                     all_losses = []
 
-                    with tqdm(total=len(train_eval_loader), initial=0, leave=False, position=1, dynamic_ncols=True) as pbar_inner:
                         for inferi, (inputs, targets) in enumerate(train_eval_loader):
                             inputs = inputs.to(device)
                             targets = targets.to(device)
@@ -576,8 +632,6 @@ if __name__=='__main__':
                             all_losses.append(loss.item())
 
                             if args.n_test_batches != -1 and inferi >= args.n_test_batches -1 : break
-                            pbar_inner.set_description(f'Computing metrics for train (Batch {inferi+1})')
-                            pbar_inner.update(1)
 
                     all_targets = np.concatenate(all_targets_list) # N, S
                     all_predictions = np.concatenate(all_predictions_list) # N, S, T or N, S
@@ -599,13 +653,11 @@ if __name__=='__main__':
 
 
                     # TEST METRICS
-                    pbar.set_description('Tracking: Computing TEST metrics')
                     all_targets_list = []
                     all_predictions_list = []
                     all_predictions_most_certain_list = []
                     all_losses = []
 
-                    with tqdm(total=len(test_eval_loader), initial=0, leave=False, position=1, dynamic_ncols=True) as pbar_inner:
                         for inferi, (inputs, targets) in enumerate(test_eval_loader):
                             inputs = inputs.to(device)
                             targets = targets.to(device)
@@ -639,8 +691,6 @@ if __name__=='__main__':
                             all_losses.append(loss.item())
 
                             if args.n_test_batches != -1 and inferi >= args.n_test_batches -1: break
-                            pbar_inner.set_description(f'Computing metrics for test (Batch {inferi+1})')
-                            pbar_inner.update(1)
 
                     all_targets = np.concatenate(all_targets_list)
                     all_predictions = np.concatenate(all_predictions_list)
@@ -741,28 +791,21 @@ if __name__=='__main__':
 
                             # --- Small-World Health Check ---
                             if hasattr(model, 'out_neuron_indices_left'):
-                                visualize_small_world_diagnostics(model, synch_out_viz, f"{args.log_dir}/sw_diagnostics/sw", bi)
-                                visualize_evolution_metrics(model, synch_out_viz, f'{args.log_dir}/sw_evolution.png')
-
                                 decay = np.exp(-model.decay_params_out.detach().cpu().numpy())
                                 left = model.out_neuron_indices_left.detach().cpu().numpy()
                                 right = model.out_neuron_indices_right.detach().cpu().numpy()
                                 activity_np = synch_out_viz
-                                
                                 self_loop_edge_mask = (left == right)
+
+                                visualize_small_world_diagnostics(model, synch_out_viz, f"{args.log_dir}/sw_diagnostics/sw", bi)
+                                visualize_evolution_metrics(model, synch_out_viz, f'{args.log_dir}/sw_evolution.png')
                                 if self_loop_edge_mask.any():
-                                    raw_activity = activity_np[:, :, self_loop_edge_mask] # -> (Batch, Time, Num_Hubs)
+                                    plot_hub_correlation(activity_np, self_loop_edge_mask, f"{args.log_dir}/sw_diagnostics/sw", bi)
+                                    raw_activity = activity_np[:, :, self_loop_edge_mask] 
                                     label = "Hub"
-                                    
-                                    # Calculate Decay Rates (Hubs vs Others)
-                                    self_decay = decay[self_loop_edge_mask].mean()
-                                    other_decay = decay[~self_loop_edge_mask].mean()
-                                    decay_str = f"| Decay: Self={self_decay:.3f} / Other={other_decay:.3f}"
-                                    
                                 else:
                                     raw_activity = activity_np
                                     label = "Global"
-                                    decay_str = ""
 
                                 # --- VITAL SIGN 1: ENERGY & DEATH ---
                                 # Average over Batch (0) and Time (1) to get per-neuron stats
@@ -777,28 +820,38 @@ if __name__=='__main__':
                                 batch_activity = np.abs(raw_activity).mean(axis=1) 
                                 
                                 try:
-                                    # SVD on (Batch, Features)
-                                    _, S, _ = np.linalg.svd(batch_activity)
-                                    sing_vals = S / (S.sum() + 1e-9)
+                                    _, S_val, _ = np.linalg.svd(batch_activity)
+                                    sing_vals = S_val / (S_val.sum() + 1e-9)
                                     effective_rank = np.exp(-np.sum(sing_vals * np.log(sing_vals + 1e-9)))
                                 except:
                                     effective_rank = 0.0
 
-                                tqdm.write(
-                                    f"[Iter {bi}] {label} Energy: {hub_energy:.4f} | "
-                                    f"Dead: {dead_pct:.1f}% | "
-                                    f"Rank: {effective_rank:.1f} {decay_str}"
-                                )
+                                # Dashboard
+                                vitals_stats['energy'] = hub_energy
+                                vitals_stats['dead'] = dead_pct
+                                vitals_stats['rank'] = effective_rank
                         #  except Exception as e:
                         #       print(f"Visualization failed for model {args.model}: {e}")
                     # --- End Visualization ---
 
                 model.train() # Switch back to train mode
+            
+            # --- UI UPDATE ---
+            current_loss = loss.item()
+            current_acc = accuracy_finegrained
+            job_progress.update(task_id, advance=1)
+            
+            # Re-render the dashboard
+            live.update(make_dashboard(
+                bi, args.training_iterations, 
+                current_loss, current_acc, 
+                grad_stats, vitals_stats, 
+                job_progress
+            ))
 
 
             # Save model checkpoint
             if (bi % args.save_every == 0 or bi == args.training_iterations - 1) and bi != start_iter:
-                pbar.set_description('Saving model checkpoint...')
                 checkpoint_data = {
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
@@ -822,5 +875,3 @@ if __name__=='__main__':
                     'random_rng_state': random.getstate(),
                 }
                 torch.save(checkpoint_data, f'{args.log_dir}/checkpoint.pt')
-
-            pbar.update(1)

@@ -449,6 +449,29 @@ def visualize_topology_matrix(model, save_path="sw_matrix.png"):
     plt.close()
 
 
+def plot_hub_correlation(activity_np, is_hub_mask, save_prefix, step_num):
+    """
+    Visualizes Hub Phase-Locking.
+    Red Square = Seizure (Hypersynchrony). Diagonal/Plaid = Healthy Independence.
+    """
+    # Extract only Hub activity (Batch, Time, Hubs)
+    hub_activity = activity_np[:, :, is_hub_mask]
+    B, T, N = hub_activity.shape
+    
+    # Flatten Batch/Time to treat every tick as a sample
+    flat_activity = hub_activity.reshape(B*T, N)
+
+    corr = np.corrcoef(flat_activity.T + 1e-9)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(corr, vmin=-1, vmax=1, cmap="coolwarm", center=0)
+    plt.title(f"Hub Phase-Locking (Step {step_num})")
+    plt.xlabel("Hub Index")
+    plt.ylabel("Hub Index")
+    plt.tight_layout()
+    plt.savefig(f"{save_prefix}_correlation_{step_num}.png")
+    plt.close()
+
+
 # --- CONFIGURATION: NEON PALETTE ---
 COLOR_HUB     = "#E056FD"  # Electric Purple
 COLOR_REWIRED = "#00FFFF"  # Cyan
