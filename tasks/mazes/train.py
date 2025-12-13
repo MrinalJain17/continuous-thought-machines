@@ -98,9 +98,9 @@ def make_dashboard(iter_num, total_iters, loss, acc, grad_stats, vitals_stats, o
         f"Dead:   [red]{vitals_stats.get('dead', 0.0):.1f}%[/]\n"
         f"Rank:   [cyan]{vitals_stats.get('rank', 0.0):.1f}[/]\n"
         f"[dim]──────────────[/]\n"
-        f"r(Self): {vitals_stats.get('r_self', 0.0):.2f}\n"
-        f"r(Lat):  [bold yellow]{vitals_stats.get('r_latt', 0.0):.2f}[/]\n"
-        f"r(Feed): {vitals_stats.get('r_feed', 0.0):.2f}"
+        f"r(Self): {vitals_stats.get('r_self_mean', 0.0):.2f}±[dim]{vitals_stats.get('r_self_std', 0.0):.2f}[/]\n"
+        f"r(Lat):  [bold yellow]{vitals_stats.get('r_latt_mean', 0.0):.2f}[/]±[dim]{vitals_stats.get('r_latt_std', 0.0):.2f}[/]\n"
+        f"r(Feed): {vitals_stats.get('r_feed_mean', 0.0):.2f}±[dim]{vitals_stats.get('r_feed_std', 0.0):.2f}[/]"
     )
     vitals_panel = Panel(vitals_content, title="Core Vitals", border_style="red")
 
@@ -457,7 +457,12 @@ if __name__=='__main__':
 
     # Training
     grad_stats = {'hubs': 0.0, 'feeders': 0.0}
-    vitals_stats = {'energy': 0.0, 'dead': 0.0, 'rank': 0.0, 'r_self': 0.0, 'r_latt': 0.0, 'r_feed': 0.0}
+    vitals_stats = {
+        'r_self_mean': 0.0, 'r_self_std': 0.0,
+        'r_latt_mean': 0.0, 'r_latt_std': 0.0,
+        'r_feed_mean': 0.0, 'r_feed_std': 0.0,
+        'energy': 0.0, 'dead': 0.0, 'rank': 0.0,
+    }
     optim_stats = {'lr': 0.0, 'gu': -1.0, 'gc': 0.0}
     task_stats = {} # Will be populated dynamically
     
@@ -843,17 +848,33 @@ if __name__=='__main__':
                                     effective_rank = 0.0
 
                                 # C. Granular Decay Rates (Latency Risk Check)
-                                r_self = decay[mask_self].mean() if mask_self.any() else 0.0
-                                r_latt = decay[mask_lattice].mean() if mask_lattice.any() else 0.0
-                                r_feed = decay[mask_feeder].mean() if mask_feeder.any() else 0.0
+                                if mask_self.any():
+                                    r_self_mean = decay[mask_self].mean().item()
+                                    r_self_std = decay[mask_self].std().item()
+                                else:
+                                    r_self_mean, r_self_std = 0.0, 0.0
+
+                                if mask_lattice.any():
+                                    r_latt_mean = decay[mask_lattice].mean().item()
+                                    r_latt_std = decay[mask_lattice].std().item()
+                                else:
+                                    r_latt_mean, r_latt_std = 0.0, 0.0
+
+                                if mask_feeder.any():
+                                    r_feed_mean = decay[mask_feeder].mean().item()
+                                    r_feed_std = decay[mask_feeder].std().item()
+                                else:
+                                    r_feed_mean, r_feed_std = 0.0, 0.0
 
                                 # Update State for Dashboard
-                                vitals_stats['energy'] = hub_energy
-                                vitals_stats['dead'] = dead_pct
-                                vitals_stats['rank'] = effective_rank
-                                vitals_stats['r_self'] = r_self
-                                vitals_stats['r_latt'] = r_latt
-                                vitals_stats['r_feed'] = r_feed
+                                vitals_stats.update({
+                                    'r_self_mean': r_self_mean, 'r_self_std': r_self_std,
+                                    'r_latt_mean': r_latt_mean, 'r_latt_std': r_latt_std,
+                                    'r_feed_mean': r_feed_mean, 'r_feed_std': r_feed_std,
+                                    'energy': hub_energy,
+                                    'dead': dead_pct,
+                                    'rank': effective_rank
+                                })
                         #  except Exception as e:
                         #       print(f"Visualization failed for model {args.model}: {e}")
                     # --- End Visualization ---
