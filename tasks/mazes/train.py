@@ -557,8 +557,10 @@ if __name__=='__main__':
                         left = model.out_neuron_indices_left
                         right = model.out_neuron_indices_right
                         is_hub = (left == right)
-                        grad_stats['hubs'] = d_params[is_hub].norm().item()
-                        grad_stats['feeders'] = d_params[~is_hub].norm().item()
+                        # Normalize by the AMP scale factor
+                        scale = scaler.get_scale()
+                        grad_stats['hubs'] = d_params[is_hub].norm().item() / scale
+                        grad_stats['feeders'] = d_params[~is_hub].norm().item() / scale
 
             optim_stats['gu'] = -1.0
             if args.gradient_clipping != -1:
