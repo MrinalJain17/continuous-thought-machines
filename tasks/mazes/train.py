@@ -476,7 +476,7 @@ if __name__=='__main__':
         TimeElapsedColumn(),
         TimeRemainingColumn(),
     )
-    task_id = job_progress.add_task("[green]Training...", total=args.training_iterations)
+    task_id = job_progress.add_task("[green]Training...[/]", total=args.training_iterations)
     iterator = iter(trainloader)
     with Live(refresh_per_second=4) as live:
         for bi in range(start_iter, args.training_iterations):
@@ -594,7 +594,7 @@ if __name__=='__main__':
 
             # Metrics tracking and plotting
             if bi%args.track_every==0 and (bi != 0 or args.reload_model_only):
-                job_progress.update(task_id, description="[yellow]Evaluating...")
+                job_progress.update(task_id, description="[yellow]Evaluating...[/]")
                 model.eval() # Use eval mode for consistency during tracking
                 with torch.inference_mode(): # Use inference mode for tracking
 
@@ -879,7 +879,7 @@ if __name__=='__main__':
                         #       print(f"Visualization failed for model {args.model}: {e}")
                     # --- End Visualization ---
 
-                job_progress.update(task_id, description="[green]Training...")
+                job_progress.update(task_id, description="[green]Training...[/]")
                 model.train() # Switch back to train mode
             
             # --- UI UPDATE ---
