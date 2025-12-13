@@ -22,7 +22,7 @@ from data.custom_datasets import MazeImageFolder
 from models.ctm import ContinuousThoughtMachine
 from models.lstm import LSTMBaseline
 from models.ff import FFBaseline
-from tasks.mazes.plotting import make_maze_gif, visualize_ctm_dashboard, visualize_topology_matrix, export_full_network
+from tasks.mazes.plotting import make_maze_gif, visualize_small_world_diagnostics, visualize_topology_matrix, export_full_network, visualize_evolution_metrics, plot_hub_correlation
 from tasks.image_classification.plotting import plot_neural_dynamics 
 from utils.housekeeping import set_seed, zip_python_code
 from utils.losses import maze_loss 
@@ -451,7 +451,19 @@ if __name__=='__main__':
 
     if args.model == 'ctm' and hasattr(model, 'out_neuron_indices_left'):
         export_full_network(model, save_path=f"{args.log_dir}/sw_full_network.graphml")
-        visualize_topology_matrix(model, save_path=f"{args.log_dir}/sw_topology_matrix.png")
+        # CORE VIEW: Verify the Ring and Hub Wiring
+        visualize_topology_matrix(
+            model, 
+            save_path=f"{args.log_dir}/topology_matrix_core.png",
+            zoom_core=True
+        )
+
+        # GLOBAL VIEW: Verify Feeder Sparsity & Target Distribution
+        visualize_topology_matrix(
+            model, 
+            save_path=f"{args.log_dir}/topology_matrix_global.png",
+            zoom_core=False
+        )
 
     # Training
     grad_stats = {'hubs': 0.0, 'feeders': 0.0}
@@ -836,9 +848,11 @@ if __name__=='__main__':
                                 mask_feeder = ~is_source_hub                # Sensory Input
 
                                 # Visualizations
-                                visualize_ctm_dashboard(model, synch_out_viz, f'{diag_dir}/sw_evolution_{bi}.png', bi)
+                                visualize_small_world_diagnostics(model, synch_out_viz, f"{args.log_dir}/sw_diagnostics/sw", bi)
+                                visualize_evolution_metrics(model, synch_out_viz, f'{args.log_dir}/sw_evolution.png')
                                 
                                 if mask_self.any():
+                                    plot_hub_correlation(activity_np, mask_self, f"{args.log_dir}/sw_diagnostics/sw", bi)
                                     raw_activity = activity_np[:, :, mask_self] # Focus Vitals on Core
                                 else:
                                     raw_activity = activity_np # Fallback
