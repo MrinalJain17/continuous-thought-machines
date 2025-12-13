@@ -5,6 +5,7 @@ import torch
 import os
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
+import matplotlib.gridspec as gridspec
 import imageio
 import seaborn as sns
 import networkx as nx
@@ -216,269 +217,202 @@ def make_maze_gif(inputs, predictions, targets, attention_tracking, save_locatio
     plt.close(fig)
 
 
-def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_num):
-    """
-    Generates diagnostics for Small-World CTM.
-    1. Histogram: Shows distribution of decay_param values (NOT decay rates r)
-    2. Heatmap: Sorted by decay_param to visualize functional hierarchy
-
-    r = exp(-decay_param)
-    - param ≈ 0.1  → r ≈ 0.9 (Leaky Integrator / Hubs)
-    - param ≈ 0.5  → r ≈ 0.6 (Fast Relay / Lattice)
-    - param ≈ 3.0  → r ≈ 0.05 (Fast Transmission / Rewired)
-    """
+def visualize_ctm_dashboard(model, synch_out, save_path, step_num):
+    sns.set_context("talk", font_scale=1.0)
+    sns.set_style("whitegrid")
+    
+    activity = np.mean(synch_out, axis=0)
     decay_params = model.decay_params_out.detach().cpu().numpy()
     left = model.out_neuron_indices_left.cpu().numpy()
     right = model.out_neuron_indices_right.cpu().numpy()
-    is_hub = (left == right)
+    is_hub_edge = (left == right)
     
-    # =========================================================
-    # PLOT 1: Topology Structure (Log-Scale Histogram)
-    # =========================================================
-    fig, ax = plt.subplots(figsize=(12, 7))
+    hub_edge_indices = np.where(is_hub_edge)[0] 
+    hub_decays = decay_params[is_hub_edge]
     
-    # Use 150 bins to smooth the distribution visually (vs 1000 which is too noisy)
-    bins = np.linspace(-0.2, 5.5, 150)
+    # SORTING: Slow -> Fast (Sort the Edge IDs based on their decay value)
+    sort_idx = np.argsort(hub_decays)
+    sorted_edge_indices = hub_edge_indices[sort_idx]
     
-    # Plot Hubs (Blue) - "The Core"
-    sns.histplot(decay_params[is_hub], color="blue", label="Hubs (Self-Pairs)", 
-                 element="step", fill=True, alpha=0.3, bins=bins, ax=ax)
+    # Data for plots
+    hub_activity_T = activity[:, sorted_edge_indices].T      # (Hubs, Time)
+    hub_activity_time = activity[:, sorted_edge_indices]     # (Time, Hubs)
     
-    # Plot Non-Hubs (Orange) - "The Wiring"
-    sns.histplot(decay_params[~is_hub], color="orange", label="Connections", 
-                 element="step", fill=True, alpha=0.3, bins=bins, ax=ax)
-    
-    # Add heavy outlines for clarity
-    sns.histplot(decay_params[is_hub], color="blue", element="step", fill=False, lw=2, bins=bins, ax=ax)
-    sns.histplot(decay_params[~is_hub], color="orange", element="step", fill=False, lw=2, bins=bins, ax=ax)
-    
-    ax.set_yscale('log')
-    ax.set_xlim(-0.2, 5.5) # Adjusted to focus on positive range since we clamp
-    
-    # Reference Lines & Labels
-    ylim = ax.get_ylim()
-    text_y = 10**(np.log10(ylim[1]) * 0.85)
-    
-    # Zone 1: Leaky Integrator (Param = LogNormal with mean ~ 0.1)
-    ax.axvspan(0.0, 0.3, color='blue', alpha=0.1, label='Hub Memory Zone')
-    ax.text(0.15, text_y, "Leaky Integrator\n(Scale-Free)\nr > 0.74", 
-            ha='center', va='top', color='blue', fontsize=9, fontweight='bold')
-
-    # Zone 2: Fast Relay (Param ~ 0.5)
-    ax.axvline(x=0.5, color='green', linestyle='--', alpha=0.3)
-    ax.text(0.55, text_y*0.5, "Fast Relay\nr≈0.6\n(Lattice)", 
-            ha='left', va='top', color='green', fontsize=9, fontweight='bold')
-
-    # Zone 3: Fast Transmission (Param ~ 3.0)
-    ax.axvline(x=3.0, color='cyan', linestyle='--', alpha=0.3)
-    ax.text(3.1, text_y, "Transmission\nr≈0.05\n(Rewired)", 
-            ha='left', va='top', color='cyan', fontsize=9, fontweight='bold')
-    
-    ax.set_title(f"Small-World Topology at Step {step_num}\n(Decay Parameter Distribution)")
-    ax.set_xlabel("Decay Parameter p (r = e^-p)")
-    ax.set_ylabel("Count (Log Scale)")
-    ax.legend(loc='upper right')
-    ax.grid(True, alpha=0.3, which="both")
-    
-    plt.tight_layout()
-    plt.savefig(f"{save_prefix}_structure_{step_num}.png")
-    plt.close()
+    global_mean_activity = np.abs(activity).mean(axis=0)
+    hubs_mean_activity = global_mean_activity[sorted_edge_indices]
 
     # =========================================================
-    # PLOT 2: Neural Behavior (Sorted Heatmap)
+    # METRICS
     # =========================================================
-    activity_avg = synch_out_viz.mean(axis=1)  # (Iterations, Pairs)
+    dead_hub_rate = (hubs_mean_activity < 1e-6).mean()
     
-    # Separate hub and non-hub activity
-    hubs_activity = activity_avg[:, is_hub].T  # (num_hubs, Time)
-    nonhub_activity = activity_avg[:, ~is_hub].T  # (num_nonhubs, Time)
-    nonhub_decays = decay_params[~is_hub]
+    n = len(hubs_mean_activity)
+    sorted_act = np.sort(hubs_mean_activity)
     
-    # Sort non-hubs by decay_param (Low -> High)
-    sort_indices = np.argsort(nonhub_decays)
-    nonhub_activity_sorted = nonhub_activity[sort_indices, :]
+    # Gini Coefficient
+    lorenz_curve = np.cumsum(sorted_act) / (sorted_act.sum() + 1e-9)
+    gini = ((2 * np.arange(1, n + 1) - n - 1) * sorted_act).sum() / (n * sorted_act.sum() + 1e-9)
     
-    # Downsample visual
-    if nonhub_activity_sorted.shape[0] > hubs_activity.shape[0] * 2:
-        indices = np.linspace(0, nonhub_activity_sorted.shape[0]-1, 
-                             hubs_activity.shape[0] * 2, dtype=int)
-        nonhub_activity_sorted = nonhub_activity_sorted[indices, :]
-
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10), sharex=True)
-    robust_max = np.percentile(activity_avg, 99) 
-    
-    sns.heatmap(hubs_activity, ax=ax1, cmap="magma", cbar=True, vmin=0, vmax=robust_max)
-    ax1.set_title("Hub Activity (Self-Pairs)")
-    ax1.set_ylabel("Hub Neurons")
-    
-    sns.heatmap(nonhub_activity_sorted, ax=ax2, cmap="viridis", cbar=True, vmin=0, vmax=robust_max)
-    ax2.set_title("Connection Activity\n(Top = Fast Relay/Lattice, Bottom = Transmission/Rewired)")
-    ax2.set_ylabel("Connections (Sorted by Param)")
-    ax2.set_xlabel("Time Steps")
-    
-    plt.tight_layout()
-    plt.savefig(f"{save_prefix}_behavior_{step_num}.png")
-    plt.close()
-
-
-def visualize_evolution_metrics(model, synch_out_viz, save_path="sw_evolution.png"):
-    activity = synch_out_viz
-    
-    # Hub Extraction
-    left = model.out_neuron_indices_left.detach().cpu().numpy()
-    right = model.out_neuron_indices_right.detach().cpu().numpy()
-    self_loop_edge_mask = (left == right)
-    
-    # Calculate global mean activity over Batch (0) and Time (1) -> Shape: [n_synch_edges]
-    global_mean_activity = np.abs(activity).mean(axis=(0, 1))
-    
-    hubs_only_flag = False 
-    if self_loop_edge_mask.any():
-        hubs_only = global_mean_activity[self_loop_edge_mask]
-        hubs_only_flag = True
-    else:
-        # Fallback: If no self-loops, treat top 10% most active neurons as "functional hubs"
-        threshold = np.percentile(global_mean_activity, 90)
-        hubs_only = global_mean_activity[global_mean_activity > threshold]
-
-    # Vital Signs
-    dead_hub_rate = (hubs_only < 1e-6).sum() / (len(hubs_only) + 1e-9)
-    global_energy = global_mean_activity.sum() 
-
-    # Metrics
-    sorted_hubs = np.sort(hubs_only)
-    n = len(hubs_only)
-    index = np.arange(1, n + 1)
-    gini = ((2 * index - n - 1) * sorted_hubs).sum() / (n * sorted_hubs.sum() + 1e-9)
-
-    p = hubs_only / (hubs_only.sum() + 1e-9)
+    # Entropy
+    p = sorted_act / (sorted_act.sum() + 1e-9)
     entropy = -np.sum(p * np.log(p + 1e-9))
-
-    # Effective Rank
-    # We measure the SVD of the activity, averaged over time (axis 1)
-    batch_activity = np.abs(activity).mean(axis=1)
     
-    # This tells us if the "Core" is collapsing or diverse
-    if self_loop_edge_mask.any():
-        target_activity = batch_activity[:, self_loop_edge_mask]
-    else:
-        target_activity = batch_activity
-
+    # Effective Rank (SVD on Temporal Dynamics)
     try:
-        _, S, _ = np.linalg.svd(target_activity)
-        singular_vals = S / (S.sum() + 1e-9)
-        effective_rank = np.exp(-np.sum(singular_vals * np.log(singular_vals + 1e-9)))
+        _, S, _ = np.linalg.svd(hub_activity_time.T)
+        norm_S = S / (S.sum() + 1e-9)
+        effective_rank = np.exp(-np.sum(norm_S * np.log(norm_S + 1e-9)))
     except:
         effective_rank = 0.0
-        singular_vals = np.zeros(10)
+        S = np.zeros(10)
 
-    # Visualization
-    fig, ax = plt.subplots(1, 3, figsize=(22, 6))
+    # =========================================================
+    # PLOTTING
+    # =========================================================
+    fig = plt.figure(figsize=(22, 18))
+    
+    gs = gridspec.GridSpec(3, 3, height_ratios=[1, 1.2, 1], hspace=0.4, wspace=0.25)
+    
+    COLOR_HUB = '#E056FD'  # Neon Purple
+    COLOR_CONN = '#FFAA00' # Orange
+    
+    # --- ROW 1: STRUCTURE (Decay Distribution) ---
+    ax_struct = plt.subplot(gs[0, :])
+    bins = np.linspace(-0.2, 5.5, 150)
+    
+    sns.histplot(decay_params[is_hub_edge], color=COLOR_HUB, element="step", fill=True, alpha=0.3, bins=bins, ax=ax_struct, label='Hubs (Core)')
+    sns.histplot(decay_params[is_hub_edge], color=COLOR_HUB, element="step", fill=False, lw=3, bins=bins, ax=ax_struct)
+    sns.histplot(decay_params[~is_hub_edge], color=COLOR_CONN, element="step", fill=True, alpha=0.3, bins=bins, ax=ax_struct, label='Connections')
+    
+    ax_struct.set_yscale('log')
+    ax_struct.set_xlim(-0.2, 5.5)
+    ax_struct.set_title(f"1. Structure: Decay Parameter Distribution (Step {step_num})", fontweight='bold')
+    ax_struct.set_xlabel("Decay Parameter p (r = e^-p)")
+    
+    # Reference Zones
+    ylim = ax_struct.get_ylim()
+    # Zone 1: Memory (0.0 - 0.3)
+    ax_struct.axvspan(0.0, 0.3, color=COLOR_HUB, alpha=0.1)
+    ax_struct.text(0.15, ylim[1]*0.5, "Scale-Free\nMemory\n(r > 0.74)", 
+                   ha='center', color=COLOR_HUB, fontweight='bold', fontsize=12)
+    # Zone 2: Lattice (0.5)
+    ax_struct.axvline(0.5, color='green', linestyle='--', alpha=0.5)
+    ax_struct.text(0.55, ylim[1]*0.2, "Lattice (0.5)", color='green', fontsize=10)
+    # Zone 3: Rewired/Feeders (3.0)
+    ax_struct.axvline(3.0, color='cyan', linestyle='--', alpha=0.5)
+    ax_struct.text(3.05, ylim[1]*0.2, "Feeders (3.0)", color='cyan', fontsize=10)
+    
+    ax_struct.legend(loc='upper right', frameon=True)
 
-    # Plot A: Lorenz Curve
-    lorenz_curve = np.cumsum(sorted_hubs) / (sorted_hubs.sum() + 1e-9)
-    ax[0].plot(np.linspace(0, 1, n), lorenz_curve, color='purple', lw=2)
-    ax[0].plot([0, 1], [0, 1], 'k--', alpha=0.3)
-    title_label = "Hub" if hubs_only_flag else "Functional"
-    ax[0].set_title(f"{title_label} Inequality (Gini: {gini:.2f})\nHigh = Winner-Take-All")
+    # --- ROW 2A: BEHAVIOR (Sorted Heatmap) ---
+    ax_behav = plt.subplot(gs[1, 0])
+    robust_max = np.percentile(hub_activity_T, 99)
+    sns.heatmap(hub_activity_T, ax=ax_behav, cmap="magma", cbar=False, vmin=0, vmax=robust_max)
+    ax_behav.set_title("2A. Behavior (Sorted by Decay)", fontweight='bold')
+    ax_behav.set_ylabel("Hubs (Slow → Fast)")
+    ax_behav.set_xlabel("Time Steps")
+    
+    # --- ROW 2B: PHASE LOCKING (Sorted Correlation) ---
+    ax_corr = plt.subplot(gs[1, 1:])
+    corr = np.corrcoef(hub_activity_time.T + 1e-9) 
+    sns.heatmap(corr, ax=ax_corr, cmap="coolwarm", center=0, vmin=-1, vmax=1, cbar_kws={'label': 'Correlation'})
+    ax_corr.set_title("2B. Phase-Locking (Sorted by Decay)", fontweight='bold')
+    ax_corr.set_xlabel("Hubs (Slow → Fast)")
+    ax_corr.set_ylabel("Hubs (Slow → Fast)")
 
-    # Plot B: Activity Dist (Entropy)
-    sns.histplot(hubs_only, bins=20, ax=ax[1], color='orange', kde=True)
-    ax[1].set_title(f"{title_label} Load (Entropy: {entropy:.2f})\nDead Hubs: {dead_hub_rate*100:.1f}%")
-    ax[1].set_xlabel("Activity Magnitude")
+    # --- ROW 3A: INEQUALITY (Gini) ---
+    ax_gini = plt.subplot(gs[2, 0])
+    ax_gini.plot(np.linspace(0, 1, n), lorenz_curve, color=COLOR_HUB, lw=4)
+    ax_gini.plot([0, 1], [0, 1], 'k--', alpha=0.3)
+    ax_gini.set_title(f"3A. Gini: {gini:.2f}", fontweight='bold')
+    ax_gini.set_ylabel("Cumulative Activity")
+    ax_gini.text(0.6, 0.1, "Winner-Take-All" if gini > 0.5 else "Democratic", transform=ax_gini.transAxes, fontsize=10)
+    
+    # --- ROW 3B: RANK (SVD) ---
+    ax_rank = plt.subplot(gs[2, 1])
+    ax_rank.plot(S[:min(20, len(S))], marker='o', color='green', markersize=8)
+    ax_rank.set_title(f"3B. Rank: {effective_rank:.1f}", fontweight='bold')
+    ax_rank.set_ylabel("Singular Value")
 
-    # Plot C: Dimensionality (Rank)
-    ax[2].plot(singular_vals[:min(50, len(singular_vals))], marker='o', markersize=3, color='green')
-    ax[2].set_title(f"Feature Diversity\nRank: {effective_rank:.1f}")
-    ax[2].set_ylabel("Singular Val Strength")
+    # --- ROW 3C: LOAD (Entropy) ---
+    ax_hist = plt.subplot(gs[2, 2])
+    sns.histplot(hubs_mean_activity, bins=15, ax=ax_hist, color='orange', kde=True)
+    ax_hist.set_title(f"3C. Entropy: {entropy:.2f}", fontweight='bold')
+    ax_hist.set_xlabel("Mean Activity")
+    ax_hist.text(0.95, 0.95, f"Dead: {dead_hub_rate*100:.0f}%", 
+                 transform=ax_hist.transAxes, ha='right', va='top', color='red', fontweight='bold')
 
-    plt.tight_layout()
     plt.savefig(save_path)
     plt.close()
+    
+    # Reset context to avoid affecting other plots in the loop
+    sns.reset_orig()
 
-    return {
-        "gini": gini, 
-        "entropy": entropy, 
-        "rank": effective_rank, 
-        "dead_hubs": dead_hub_rate,
-        "energy": global_energy
-    }
+    return {"gini": gini, "entropy": entropy, "rank": effective_rank, "dead_hubs": dead_hub_rate}
 
 
-def visualize_topology_matrix(model, save_path="sw_matrix.png", zoom_core=True, step=None):
+def visualize_topology_matrix(model, save_path="sw_matrix.png"):
     """Visualizes the Small-World connectivity as an Adjacency Matrix Scatter Plot."""
-    left = model.out_neuron_indices_left.cpu().numpy()
-    right = model.out_neuron_indices_right.cpu().numpy()
+    left = model.out_neuron_indices_left.detach().cpu().numpy()
+    right = model.out_neuron_indices_right.detach().cpu().numpy()
     decays = model.decay_params_out.detach().cpu().numpy()
     
-    # Masks
-    mask_self = (left == right)
+    is_self = (left == right)
+    hub_indices = np.unique(left[is_self])
+    hub_indices.sort()
     
-    # Threshold 2.0 separates Lattice (p~0.5) from Feeders (p~3.0)
-    mask_lattice = (~mask_self) & (decays < 2.0)
-    mask_rewired = (~mask_self) & (decays >= 2.0)
-    
-    plt.figure(figsize=(12, 12))
-    
-    # Feeders (Blue) - "Sensory Input"
-    plt.scatter(left[mask_rewired], right[mask_rewired], 
-                c='dodgerblue', s=15, alpha=0.4, label='Feeders (Sensory)', marker='.')
-                
-    # Lattice (Green) - "Ring Backbone"
-    plt.scatter(left[mask_lattice], right[mask_lattice], 
-                c='limegreen', s=25, alpha=0.8, label='Lattice (Relay)', marker='o')
+    num_hubs = len(hub_indices)
+    if num_hubs == 0:
+        print("Warning: No Hubs found for Matrix visualization.")
+        return
 
-    # Hubs (Navy) - "Memory Core"
-    plt.scatter(left[mask_self], right[mask_self], 
-                c='navy', s=60, alpha=1.0, label='Hubs (Core)', marker='D')
+    # Map real ID (e.g., 40, 80) -> Logical ID (e.g., 1, 2)
+    idx_map = {real_id: i for i, real_id in enumerate(hub_indices)}
+    
+    # Filter edges to ONLY show Core-to-Core connections (Hub -> Hub)
+    # This removes Feeders to focus strictly on the Ring/Lattice structure
+    mask_core = np.isin(left, hub_indices) & np.isin(right, hub_indices)
+    
+    core_left = left[mask_core]
+    core_right = right[mask_core]
+    core_decays = decays[mask_core]
+    
+    # Map to logical coordinates
+    logical_left = np.array([idx_map[x] for x in core_left])
+    logical_right = np.array([idx_map[x] for x in core_right])
+    
+    # Logical Self-Loops (Diagonal)
+    mask_logical_self = (logical_left == logical_right)
+    # Logical Lattice (Neighbors) vs Long-Range (if any)
+    mask_logical_lattice = (~mask_logical_self) & (core_decays < 2.0)
+    
+    plt.figure(figsize=(10, 10))
+    
+    # Plot Lattice (Green) - Should form distinct bands parallel to diagonal
+    plt.scatter(logical_left[mask_logical_lattice], logical_right[mask_logical_lattice], 
+                c='limegreen', s=100, marker='s', label='Lattice (Ring)')
 
-    num_hubs = np.sum(mask_self)
-    step_str = f" (Step {step})" if step is not None else " (Initialization)"
+    # Plot Hubs (Purple) - The Diagonal
+    plt.scatter(logical_left[mask_logical_self], logical_right[mask_logical_self], 
+                c='#E056FD', s=150, marker='D', label='Hubs (Core)')
     
-    plt.title(f"Small-World Adjacency{step_str}\nHubs={num_hubs} | Green=Ring, Blue=Input")
-    plt.xlabel("Source Neuron (From)")
-    plt.ylabel("Target Neuron (To)")
+    plt.title(f"Logical Topology (Collapsed View)\nShowing {num_hubs} Hubs | Expected: Tridiagonal Band")
+    plt.xlabel("Hub Logical Index (0..N)")
+    plt.ylabel("Hub Logical Index (0..N)")
     
-    if zoom_core:
-        # Zoom in on the active core + context
-        limit = max(num_hubs * 2, 50) 
-        plt.xlim(0, limit)
-        plt.ylim(0, limit)
-        plt.grid(True, alpha=0.1, which='both')
+    # Set integer ticks if small enough
+    if num_hubs <= 50:
+        plt.xticks(np.arange(0, num_hubs, 5))
+        plt.yticks(np.arange(0, num_hubs, 5))
+        plt.grid(True, which='both', alpha=0.1, color='white')
     else:
-        # Full Sparse View
-        plt.xlim(0, model.d_model)
-        plt.ylim(0, model.d_model)
         plt.grid(False)
 
-    plt.gca().invert_yaxis() # Matrix convention (0,0 at top left)
+    plt.gca().invert_yaxis()
     plt.legend(loc='upper right')
-    
+    plt.gca().set_aspect('equal')
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
-    plt.close()
-
-
-def plot_hub_correlation(activity_np, is_hub_mask, save_prefix, step_num):
-    """
-    Visualizes Hub Phase-Locking.
-    Red Square = Seizure (Hypersynchrony). Diagonal/Plaid = Healthy Independence.
-    """
-    # Extract only Hub activity (Batch, Time, Hubs)
-    hub_activity = activity_np[:, :, is_hub_mask]
-    B, T, N = hub_activity.shape
-    
-    # Flatten Batch/Time to treat every tick as a sample
-    flat_activity = hub_activity.reshape(B*T, N)
-
-    corr = np.corrcoef(flat_activity.T + 1e-9)
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(corr, vmin=-1, vmax=1, cmap="coolwarm", center=0)
-    plt.title(f"Hub Phase-Locking (Step {step_num})")
-    plt.xlabel("Hub Index")
-    plt.ylabel("Hub Index")
-    plt.tight_layout()
-    plt.savefig(f"{save_prefix}_correlation_{step_num}.png")
     plt.close()
 
 

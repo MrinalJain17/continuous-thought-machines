@@ -589,8 +589,10 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         remainder = n_synch - all_left.size(0)
         if remainder > 0:
             # Connect random Hubs to random Neurons (Noise/Sampling)
-            fill_left = hubs[torch.randint(0, num_hubs, (remainder,), device=device)]
-            fill_right = torch.randint(0, d_model, (remainder,), device=device)
+            # Source (Left) = Random Neuron
+            # Target (Right) = Random Hub
+            fill_left = torch.randint(0, d_model, (remainder,), device=device)
+            fill_right = hubs[torch.randint(0, num_hubs, (remainder,), device=device)]
             
             # Set remainder decay type to 2.0 (Noise)
             # This prevents them from being classified as Lattice (0.0)
