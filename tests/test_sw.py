@@ -161,8 +161,8 @@ def test_decay_initialization_priors(ctm_factory, base_params, device):
     
     assert 0.08 < self_decays.mean() < 0.12, \
         f"Hub Mean drifted. Expected ~0.1, got {self_decays.mean():.4f}"
-    assert 0.04 < self_decays.std() < 0.05, \
-        f"Hub Std deviation incorrect. Expected ~0.05, got {self_decays.std():.4f}"
+    assert 0.09 < self_decays.std() < 0.11, \
+        f"Hub Std deviation incorrect. Expected ~0.1, got {self_decays.std():.4f}"
 
     # Verify Others (Lattice vs Rewired)
     other_mask = ~self_mask

@@ -97,6 +97,7 @@ def make_dashboard(iter_num, total_iters, loss, acc, grad_stats, vitals_stats, o
         f"Energy: [bold]{vitals_stats.get('energy', 0.0):.4f}[/]\n"
         f"Dead:   [red]{vitals_stats.get('dead', 0.0):.1f}%[/]\n"
         f"Rank:   [cyan]{vitals_stats.get('rank', 0.0):.1f}[/]\n"
+        f"Fast:   [magenta]{vitals_stats.get('fast_hubs', 0.0):.1f}%[/]\n"
         f"[dim]──────────────[/]\n"
         f"r(Self): {vitals_stats.get('r_self_mean', 0.0):.2f}±[dim]{vitals_stats.get('r_self_std', 0.0):.2f}[/]\n"
         f"r(Lat):  [bold yellow]{vitals_stats.get('r_latt_mean', 0.0):.2f}[/]±[dim]{vitals_stats.get('r_latt_std', 0.0):.2f}[/]\n"
@@ -461,7 +462,8 @@ if __name__=='__main__':
         'r_self_mean': 0.0, 'r_self_std': 0.0,
         'r_latt_mean': 0.0, 'r_latt_std': 0.0,
         'r_feed_mean': 0.0, 'r_feed_std': 0.0,
-        'energy': 0.0, 'dead': 0.0, 'rank': 0.0,
+        'energy': 0.0, 'dead': 0.0,
+        'rank': 0.0, 'fast_hubs': 0.0,
     }
     optim_stats = {'lr': 0.0, 'gu': -1.0, 'gc': 0.0}
     task_stats = {} # Will be populated dynamically
@@ -849,10 +851,17 @@ if __name__=='__main__':
 
                                 # C. Granular Decay Rates (Latency Risk Check)
                                 if mask_self.any():
-                                    r_self_mean = decay[mask_self].mean().item()
-                                    r_self_std = decay[mask_self].std().item()
+                                    r_self_vals = decay[mask_self]
+                                    r_self_mean = r_self_vals.mean().item()
+                                    r_self_std = r_self_vals.std().item()
+                                    
+                                    # --- Drift Check ---
+                                    # Count Hubs that have drifted to be faster than r=0.67 (becoming Lattice-like)
+                                    fast_count = (r_self_vals < 0.67).float().sum().item()
+                                    total_hubs = len(r_self_vals)
+                                    fast_hubs_pct = (fast_count / total_hubs) * 100
                                 else:
-                                    r_self_mean, r_self_std = 0.0, 0.0
+                                    r_self_mean, r_self_std, fast_hubs_pct = 0.0, 0.0, 0.0
 
                                 if mask_lattice.any():
                                     r_latt_mean = decay[mask_lattice].mean().item()
@@ -871,6 +880,7 @@ if __name__=='__main__':
                                     'r_self_mean': r_self_mean, 'r_self_std': r_self_std,
                                     'r_latt_mean': r_latt_mean, 'r_latt_std': r_latt_std,
                                     'r_feed_mean': r_feed_mean, 'r_feed_std': r_feed_std,
+                                    'fast_hubs': fast_hubs_pct,
                                     'energy': hub_energy,
                                     'dead': dead_pct,
                                     'rank': effective_rank
