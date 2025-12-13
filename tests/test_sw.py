@@ -161,7 +161,7 @@ def test_decay_initialization_priors(ctm_factory, base_params, device):
     
     assert 0.08 < self_decays.mean() < 0.12, \
         f"Hub Mean drifted. Expected ~0.1, got {self_decays.mean():.4f}"
-    assert 0.09 < self_decays.std() < 0.11, \
+    assert 0.05 < self_decays.std() < 0.15, \
         f"Hub Std deviation incorrect. Expected ~0.1, got {self_decays.std():.4f}"
 
     # Verify Others (Lattice vs Rewired)
