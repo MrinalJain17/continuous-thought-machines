@@ -630,13 +630,12 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         noise_mask = (all_decay_types == 2.0)
         decay_init[noise_mask] = torch.normal(mean=PARAM_REWIRED, std=0.2, size=(noise_mask.sum(),), device=device)
         
-        # Hubs (Leaky Integrator) -> Normal(0.1, 0.1)
+        # Hubs (Leaky Integrator) -> LogNormal(-2.3, 1.0)
         # Rationale: Variance prevents hypersynchrony
-        # Since we prevented accidental self-loops in Feeders, we can safely assume 
-        # any remaining self-loops are indeed Hubs.
-        # But to be robust, we use a mask instead of slicing.
         real_self_loops = (all_left == all_right)
-        decay_init[real_self_loops] = torch.normal(mean=PARAM_HUBS, std=0.1, size=(real_self_loops.sum(),), device=device)
+        raw_decay = torch.distributions.LogNormal(np.log(PARAM_HUBS), 1.0).sample((n_hubs,)).to(device)
+        raw_decay = torch.clamp(raw_decay, min=0.001, max=0.3)
+        decay_init[real_self_loops] = raw_decay
         
         # Clamp to ensure stability
         decay_init = torch.clamp(decay_init, min=0.001)

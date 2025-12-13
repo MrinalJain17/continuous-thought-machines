@@ -259,10 +259,10 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     ylim = ax.get_ylim()
     text_y = 10**(np.log10(ylim[1]) * 0.85)
     
-    # Zone 1: Leaky Integrator (Param ~ 0.1)
-    ax.axvline(x=0.1, color='blue', linestyle='--', alpha=0.3)
-    ax.text(0.15, text_y, "Leaky Integrator\nr≈0.9\n(Hubs)", 
-            ha='left', va='top', color='blue', fontsize=9, fontweight='bold')
+    # Zone 1: Leaky Integrator (Param = LogNormal with mean ~ 0.1)
+    ax.axvspan(0.0, 0.3, color='blue', alpha=0.1, label='Hub Memory Zone')
+    ax.text(0.15, text_y, "Leaky Integrator\n(Scale-Free)\nr > 0.74", 
+            ha='center', va='top', color='blue', fontsize=9, fontweight='bold')
 
     # Zone 2: Fast Relay (Param ~ 0.5)
     ax.axvline(x=0.5, color='green', linestyle='--', alpha=0.3)

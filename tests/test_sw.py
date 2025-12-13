@@ -155,14 +155,20 @@ def test_decay_initialization_priors(ctm_factory, base_params, device):
     right = model.out_neuron_indices_right.cpu()
     decay_params = model.decay_params_out.detach().cpu()
     
-    # Verify Self-Pairs (Hubs) ~ N(0.1, 0.05)
+    # Verify Self-Pairs (Hubs) ~ LogNormal(-2.3, 1.0)
     self_mask = (left == right)
     self_decays = decay_params[self_mask]
     
-    assert 0.08 < self_decays.mean() < 0.12, \
-        f"Hub Mean drifted. Expected ~0.1, got {self_decays.mean():.4f}"
-    assert 0.05 < self_decays.std() < 0.15, \
-        f"Hub Std deviation incorrect. Expected ~0.1, got {self_decays.std():.4f}"
+    assert self_decays.max() <= 0.30001, \
+        f"Hubs violated safety clamp! Max found: {self_decays.max()}"
+
+    median_decay = self_decays.median()
+    assert 0.05 < median_decay < 0.15, \
+        f"Hub Median drifted. Expected ~0.1, got {median_decay:.4f}"
+
+    # With LogNormal, we expect some very slow neurons (p < 0.05)
+    slow_hubs = (self_decays < 0.05).sum()
+    assert slow_hubs > 0, "Failed to generate Ultra-Slow hubs (No Heavy Tail found)"
 
     # Verify Others (Lattice vs Rewired)
     other_mask = ~self_mask

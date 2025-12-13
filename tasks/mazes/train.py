@@ -97,7 +97,7 @@ def make_dashboard(iter_num, total_iters, loss, acc, grad_stats, vitals_stats, o
         f"Energy: [bold]{vitals_stats.get('energy', 0.0):.4f}[/]\n"
         f"Dead:   [red]{vitals_stats.get('dead', 0.0):.1f}%[/]\n"
         f"Rank:   [cyan]{vitals_stats.get('rank', 0.0):.1f}[/]\n"
-        f"Fast:   [magenta]{vitals_stats.get('fast_hubs', 0.0):.1f}%[/]\n"
+        f"Leak:   [magenta]{vitals_stats.get('fast_hubs', 0.0):.1f}%[/]\n"
         f"[dim]──────────────[/]\n"
         f"r(Self): {vitals_stats.get('r_self_mean', 0.0):.2f}±[dim]{vitals_stats.get('r_self_std', 0.0):.2f}[/]\n"
         f"r(Lat):  [bold yellow]{vitals_stats.get('r_latt_mean', 0.0):.2f}[/]±[dim]{vitals_stats.get('r_latt_std', 0.0):.2f}[/]\n"
@@ -602,6 +602,20 @@ if __name__=='__main__':
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
             scheduler.step()
+
+            with torch.no_grad():
+                # Handle torch.compile or DDP wrapping
+                real_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+                real_model = real_model.module if hasattr(real_model, 'module') else real_model
+
+                # p=0.3 corresponds to decay rate r ≈ 0.74
+                if hasattr(real_model, 'decay_params_out'):
+                    is_hub = (real_model.out_neuron_indices_left == real_model.out_neuron_indices_right)
+                    real_model.decay_params_out[is_hub].clamp_(min=0.001, max=0.3)
+
+                # Just prevent explosion (r > 1). Let it be as fast as it wants.
+                if hasattr(real_model, 'decay_params_action'):
+                    real_model.decay_params_action.clamp_(min=0.001)
 
             # Metrics tracking and plotting
             if bi%args.track_every==0 and (bi != 0 or args.reload_model_only):
