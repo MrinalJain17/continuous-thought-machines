@@ -599,6 +599,7 @@ if __name__=='__main__':
                     all_predictions_most_certain_list = [] # Predictions at chosen step/tick argmax (N, S)
                     all_losses = []
 
+                    if 1:  # To avoid de-indenting due to removed tqdm ctx
                         for inferi, (inputs, targets) in enumerate(train_eval_loader):
                             inputs = inputs.to(device)
                             targets = targets.to(device)
@@ -658,6 +659,7 @@ if __name__=='__main__':
                     all_predictions_most_certain_list = []
                     all_losses = []
 
+                    if 1:  # To avoid de-indenting due to removed tqdm ctx
                         for inferi, (inputs, targets) in enumerate(test_eval_loader):
                             inputs = inputs.to(device)
                             targets = targets.to(device)
