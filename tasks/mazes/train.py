@@ -491,7 +491,7 @@ if __name__=='__main__':
     iterator = iter(trainloader)
     with Live(refresh_per_second=4) as live:
         for bi in range(start_iter, args.training_iterations):
-            optim_stats['lr'] = optimizer.param_groups[-1]['lr']
+            optim_stats['lr'] = optimizer.param_groups[0]['lr']
 
             try:
                 inputs, targets = next(iterator)
@@ -611,7 +611,7 @@ if __name__=='__main__':
                 # p=0.3 corresponds to decay rate r ≈ 0.74
                 if hasattr(real_model, 'decay_params_out'):
                     is_hub = (real_model.out_neuron_indices_left == real_model.out_neuron_indices_right)
-                    real_model.decay_params_out[is_hub].clamp_(min=0.001, max=0.3)
+                    real_model.decay_params_out[is_hub] = real_model.decay_params_out[is_hub].clamp(min=0.001, max=0.3)
 
                 # Just prevent explosion (r > 1). Let it be as fast as it wants.
                 if hasattr(real_model, 'decay_params_action'):
