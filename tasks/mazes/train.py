@@ -866,7 +866,7 @@ if __name__=='__main__':
                                     
                                     # --- Drift Check ---
                                     # Count Hubs that have drifted to be faster than r=0.67 (becoming Lattice-like)
-                                    fast_count = (r_self_vals < 0.67).float().sum().item()
+                                    fast_count = np.sum(r_self_vals < 0.67)
                                     total_hubs = len(r_self_vals)
                                     fast_hubs_pct = (fast_count / total_hubs) * 100
                                 else:
