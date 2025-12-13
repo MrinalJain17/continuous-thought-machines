@@ -39,7 +39,7 @@ python -m tasks.mazes.train \
     --training_iterations 100000
 ```
 
-Exp (Small World):
+Exp (SW) - Medium:
 ```
 python -m tasks.mazes.train \
     --dataset mazes-medium \
@@ -57,9 +57,37 @@ python -m tasks.mazes.train \
     --neuron_select_type small-world \
     --memory_length 25 \
     --memory_hidden_dims 32 \
-    --connectivity 16 \
+    --connectivity 4 \
     --rewiring_prob 0.3 \
     --batch_size 64 \
     --training_iterations 100000 \
+    --device 0 --use_amp --do_compile
+```
+
+Exp (SW) - Small:
+```
+python -m tasks.mazes.train \
+    --dataset mazes-small \
+    --log_dir logs/small_world_small_maze \
+    --model ctm \
+    --d_model 1024 \
+    --dropout 0.1 \
+    --backbone_type resnet18-1 \
+    --d_input 256 \
+    --heads 4 \
+    --iterations 50 \
+    --synapse_depth 8 \
+    --n_synch_out 128 \
+    --n_synch_action 128 \
+    --neuron_select_type small-world \
+    --memory_length 25 \
+    --memory_hidden_dims 32 \
+    --connectivity 4 \
+    --rewiring_prob 0.3 \
+    --maze_route_length 50 \
+    --batch_size 128 \
+    --batch_size_test 128 \
+    --training_iterations 50000 \
+    --n_test_batches 50 \
     --device 0 --use_amp --do_compile
 ```

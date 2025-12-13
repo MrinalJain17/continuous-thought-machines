@@ -589,6 +589,7 @@ if __name__=='__main__':
 
             # Metrics tracking and plotting
             if bi%args.track_every==0 and (bi != 0 or args.reload_model_only):
+                job_progress.update(task_id, description="[yellow]Evaluating...")
                 model.eval() # Use eval mode for consistency during tracking
                 with torch.inference_mode(): # Use inference mode for tracking
 
@@ -857,6 +858,7 @@ if __name__=='__main__':
                         #       print(f"Visualization failed for model {args.model}: {e}")
                     # --- End Visualization ---
 
+                job_progress.update(task_id, description="[green]Training...")
                 model.train() # Switch back to train mode
             
             # --- UI UPDATE ---
