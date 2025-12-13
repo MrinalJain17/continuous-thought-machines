@@ -451,9 +451,18 @@ if __name__=='__main__':
 
     if args.model == 'ctm' and hasattr(model, 'out_neuron_indices_left'):
         export_full_network(model, save_path=f"{args.log_dir}/sw_full_network.graphml")
+        # CORE VIEW: Verify the Ring and Hub Wiring
         visualize_topology_matrix(
             model, 
-            save_path=f"{args.log_dir}/topology_matrix.png"
+            save_path=f"{args.log_dir}/topology_matrix_core.png",
+            zoom_core=True
+        )
+
+        # GLOBAL VIEW: Verify Feeder Sparsity & Target Distribution
+        visualize_topology_matrix(
+            model, 
+            save_path=f"{args.log_dir}/topology_matrix_global.png",
+            zoom_core=False
         )
 
     # Training

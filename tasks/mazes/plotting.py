@@ -235,14 +235,16 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     # =========================================================
     # PLOT 1: Topology Structure (Log-Scale Histogram)
     # =========================================================
-    fig, ax = plt.subplots(figsize=(10, 6))
-    bins = np.linspace(-0.5, 5.5, 1000)
+    fig, ax = plt.subplots(figsize=(12, 7))
     
-    # Plot Hubs (Blue)
+    # Use 150 bins to smooth the distribution visually (vs 1000 which is too noisy)
+    bins = np.linspace(-0.2, 5.5, 150)
+    
+    # Plot Hubs (Blue) - "The Core"
     sns.histplot(decay_params[is_hub], color="blue", label="Hubs (Self-Pairs)", 
                  element="step", fill=True, alpha=0.3, bins=bins, ax=ax)
     
-    # Plot Non-Hubs (Orange)
+    # Plot Non-Hubs (Orange) - "The Wiring"
     sns.histplot(decay_params[~is_hub], color="orange", label="Connections", 
                  element="step", fill=True, alpha=0.3, bins=bins, ax=ax)
     
@@ -251,7 +253,7 @@ def visualize_small_world_diagnostics(model, synch_out_viz, save_prefix, step_nu
     sns.histplot(decay_params[~is_hub], color="orange", element="step", fill=False, lw=2, bins=bins, ax=ax)
     
     ax.set_yscale('log')
-    ax.set_xlim(-0.5, 5.5)
+    ax.set_xlim(-0.2, 5.5) # Adjusted to focus on positive range since we clamp
     
     # Reference Lines & Labels
     ylim = ax.get_ylim()
@@ -403,46 +405,54 @@ def visualize_evolution_metrics(model, synch_out_viz, save_path="sw_evolution.pn
     }
 
 
-def visualize_topology_matrix(model, save_path="sw_matrix.png"):
+def visualize_topology_matrix(model, save_path="sw_matrix.png", zoom_core=True, step=None):
     """Visualizes the Small-World connectivity as an Adjacency Matrix Scatter Plot."""
     left = model.out_neuron_indices_left.cpu().numpy()
     right = model.out_neuron_indices_right.cpu().numpy()
     decays = model.decay_params_out.detach().cpu().numpy()
-    d_model = model.d_model
     
     # Masks
     mask_self = (left == right)
     
-    # Lattice = Fast Relay (Param ~ 0.5)
-    # Filter: Not Self AND Param is Small (< 2.0)
+    # Threshold 2.0 separates Lattice (p~0.5) from Feeders (p~3.0)
     mask_lattice = (~mask_self) & (decays < 2.0)
-    
-    # Rewired/Noise = Fast Transmission (Param ~ 3.0)
-    # Filter: Not Self AND Param is Large (> 2.0)
     mask_rewired = (~mask_self) & (decays >= 2.0)
     
     plt.figure(figsize=(12, 12))
     
-    # Plot Rewired (Blue) - Background
+    # Feeders (Blue) - "Sensory Input"
     plt.scatter(left[mask_rewired], right[mask_rewired], 
-                c='blue', s=15, alpha=0.3, label='Rewired/Noise (Transmission)', marker='.')
+                c='dodgerblue', s=15, alpha=0.4, label='Feeders (Sensory)', marker='.')
                 
-    # Plot Lattice (Green) - Foreground Band
+    # Lattice (Green) - "Ring Backbone"
     plt.scatter(left[mask_lattice], right[mask_lattice], 
-                c='green', s=20, alpha=0.8, label='Lattice (Fast Relay)', marker='.')
+                c='limegreen', s=25, alpha=0.8, label='Lattice (Relay)', marker='o')
 
-    # Plot Hubs (Dark Blue) - Spine
+    # Hubs (Navy) - "Memory Core"
     plt.scatter(left[mask_self], right[mask_self], 
-                c='navy', s=50, alpha=1.0, label='Hubs (Leaky Integrator)', marker='o')
+                c='navy', s=60, alpha=1.0, label='Hubs (Core)', marker='D')
 
-    plt.title(f"Small-World Adjacency Matrix\n(d_model={d_model}, Edges={len(left)})")
-    plt.xlabel("Source")
-    plt.ylabel("Target")
-    plt.xlim(0, d_model)
-    plt.ylim(0, d_model)
-    plt.gca().invert_yaxis()
+    num_hubs = np.sum(mask_self)
+    step_str = f" (Step {step})" if step is not None else " (Initialization)"
+    
+    plt.title(f"Small-World Adjacency{step_str}\nHubs={num_hubs} | Green=Ring, Blue=Input")
+    plt.xlabel("Source Neuron (From)")
+    plt.ylabel("Target Neuron (To)")
+    
+    if zoom_core:
+        # Zoom in on the active core + context
+        limit = max(num_hubs * 2, 50) 
+        plt.xlim(0, limit)
+        plt.ylim(0, limit)
+        plt.grid(True, alpha=0.1, which='both')
+    else:
+        # Full Sparse View
+        plt.xlim(0, model.d_model)
+        plt.ylim(0, model.d_model)
+        plt.grid(False)
+
+    plt.gca().invert_yaxis() # Matrix convention (0,0 at top left)
     plt.legend(loc='upper right')
-    plt.grid(True, alpha=0.2)
     
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
