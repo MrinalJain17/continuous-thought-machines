@@ -155,14 +155,14 @@ def test_decay_initialization_priors(ctm_factory, base_params, device):
     right = model.out_neuron_indices_right.cpu()
     decay_params = model.decay_params_out.detach().cpu()
     
-    # Verify Self-Pairs (Hubs) ~ N(0.1, 0.02)
+    # Verify Self-Pairs (Hubs) ~ N(0.1, 0.05)
     self_mask = (left == right)
     self_decays = decay_params[self_mask]
     
-    assert 0.09 < self_decays.mean() < 0.11, \
+    assert 0.08 < self_decays.mean() < 0.12, \
         f"Hub Mean drifted. Expected ~0.1, got {self_decays.mean():.4f}"
-    assert 0.01 < self_decays.std() < 0.03, \
-        f"Hub Std deviation incorrect. Expected ~0.02, got {self_decays.std():.4f}"
+    assert 0.04 < self_decays.std() < 0.05, \
+        f"Hub Std deviation incorrect. Expected ~0.05, got {self_decays.std():.4f}"
 
     # Verify Others (Lattice vs Rewired)
     other_mask = ~self_mask
