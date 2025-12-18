@@ -14,6 +14,7 @@ from tqdm.auto import tqdm
 
 from data.custom_datasets import MazeImageFolder
 from models.ctm import ContinuousThoughtMachine
+from models.ctm_pairing_init import initialize_ctm_pairs, default_warmup_batches
 from models.lstm import LSTMBaseline
 from models.ff import FFBaseline
 from tasks.mazes.plotting import make_maze_gif
@@ -331,6 +332,18 @@ if __name__=='__main__':
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+    # One-shot CTM pairing initialization (task-agnostic).
+    # Run before torch.compile to avoid recompilations / graph breaks when resampling indices during warmup.
+    if args.model == 'ctm' and (not args.reload) and args.neuron_select_type == 'random-pairing':
+        warmup_batches = default_warmup_batches(getattr(args, 'warmup_steps', 0))
+        initialize_ctm_pairs(
+            model=model,
+            dataloader=trainloader,
+            warmup_batches=warmup_batches,
+            n_random_pairing_self=getattr(args, 'n_random_pairing_self', 0),
+        )
+
 
     if args.do_compile:
         print('Compiling...')

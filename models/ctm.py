@@ -447,6 +447,47 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             self.register_buffer(f'{synch_type}_neuron_indices_right', right)
             self.register_parameter(f'decay_params_{synch_type}', nn.Parameter(torch.zeros(synch_representation_size), requires_grad=True))
 
+
+    def set_neuron_pairs(self, synch_type: str, left: torch.Tensor, right: torch.Tensor) -> None:
+        """Overwrite neuron-pair index buffers in-place.
+
+        This is used for one-shot initialization of random-pairing indices during warmup.
+        Buffers are preserved in the state_dict.
+        """
+        assert synch_type in ('out', 'action'), f"Invalid synch_type: {synch_type}"
+        n_synch = self.n_synch_action if synch_type == "action" else self.n_synch_out
+        if n_synch == 0:
+            return
+
+        buf_left = getattr(self, f"{synch_type}_neuron_indices_left", None)
+        buf_right = getattr(self, f"{synch_type}_neuron_indices_right", None)
+        assert buf_left is not None and buf_right is not None, "Neuron index buffers not initialized."
+        assert left.shape == buf_left.shape and right.shape == buf_right.shape, (
+            f"Shape mismatch: expected {tuple(buf_left.shape)}"
+        )
+        left = left.to(device=buf_left.device, dtype=buf_left.dtype)
+        right = right.to(device=buf_right.device, dtype=buf_right.dtype)
+        buf_left.copy_(left)
+        buf_right.copy_(right)
+
+    def resample_action_pairs_(self, n_random_pairing_self: int = 0) -> None:
+        """Resample action pairing indices in-place (warmup only).
+
+        Only meaningful for neuron_select_type == 'random-pairing'. This does not re-register buffers.
+        """
+        if self.neuron_select_type != 'random-pairing':
+            return
+        if self.n_synch_action == 0:
+            return
+        left, right = self.initialize_left_right_neurons(
+            synch_type='action',
+            d_model=self.d_model,
+            n_synch=self.n_synch_action,
+            n_random_pairing_self=n_random_pairing_self,
+        )
+        self.action_neuron_indices_left.copy_(left.to(self.action_neuron_indices_left.device))
+        self.action_neuron_indices_right.copy_(right.to(self.action_neuron_indices_right.device))
+
     def initialize_left_right_neurons(self, synch_type, d_model, n_synch, n_random_pairing_self=0):
         """
         Initialize the left and right neuron indices based on the neuron selection type.
@@ -524,7 +565,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
 
 
 
-    def forward(self, x, track=False):
+    def forward(self, x, track=False, callback=None):
         B = x.size(0)
         device = x.device
 
@@ -575,6 +616,9 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
 
             # --- Apply Neuron-Level Models ---
             activated_state = self.trace_processor(state_trace)
+
+            if callback is not None:
+                callback(stepi, activated_state)
             # One would also keep an 'activated_state_trace' as the history of outgoing post-activations
             # BUT, this is unnecessary because the synchronisation calculation is fully linear and can be
             # done using only the currect activated state (see compute_synchronisation method for explanation)
@@ -601,4 +645,3 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         if track:
             return predictions, certainties, (np.array(synch_out_tracking), np.array(synch_action_tracking)), np.array(pre_activations_tracking), np.array(post_activations_tracking), np.array(attention_tracking)
         return predictions, certainties, synchronisation_out
-
