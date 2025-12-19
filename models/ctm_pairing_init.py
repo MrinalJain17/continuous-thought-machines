@@ -45,7 +45,6 @@ class WarmupDiagnostics:
     reservoir_seen_out: int
     t_star_mean: float
     t_star_std: float
-    t_star_extreme_frac: float  # fraction of batches with t_star in {0, T-1}
 
 
 @contextlib.contextmanager
@@ -127,12 +126,13 @@ class TickSnapshots:
 
 
 class TickRepresentativeCollector:
-    """Callback collector to select Z_star (max change) and Z_last (final tick) per forward pass.
+    """Select Z_star (max change) and Z_last (final tick) per forward pass.
 
-    Assumes callback is invoked once per internal tick with (tick_idx, activated_state),
+    Callback is invoked once per internal tick with (tick_idx, activated_state),
     where activated_state is the post-update state for that tick.
     """
-    def __init__(self):
+    def __init__(self, tie_rtol: float = 1e-3):
+        self.tie_rtol = tie_rtol  # deterministic tie handling for near-plateaus
         self.prev: Optional[Tensor] = None
         self.best_delta: float = -1.0
         self.best_z: Optional[Tensor] = None
@@ -140,22 +140,41 @@ class TickRepresentativeCollector:
         self.best_tick: Optional[int] = None
         self.last_tick: Optional[int] = None
 
+        # Track second best to measure plateau/ties
+        self.second_best_delta: float = -1.0
+        self.second_best_tick: Optional[int] = None
+
     def __call__(self, tick_idx: int, activated_state: Tensor):
-        # activated_state: (B, D)
         z = activated_state.detach()
         self.last_z = z
         self.last_tick = tick_idx
+
         if self.prev is not None:
-            # Δ_t = mean over batch of L2 norm of step difference
             delta = (z - self.prev).norm(dim=1).mean().item()
+
+            # Update top-2 deltas (for diagnostics)
             if delta > self.best_delta:
+                self.second_best_delta = self.best_delta
+                self.second_best_tick = self.best_tick
                 self.best_delta = delta
                 self.best_z = z
                 self.best_tick = tick_idx
+            elif delta > self.second_best_delta:
+                self.second_best_delta = delta
+                self.second_best_tick = tick_idx
+
+            # Deterministic tie handling: if near-plateau, prefer the earlier tick
+            # (keeps selection stable and avoids "always the latest in a plateau")
+            if self.best_tick is not None and self.second_best_delta >= 0:
+                # If current delta is within rtol of best and earlier, pick it
+                if (abs(delta - self.best_delta) <= self.tie_rtol * max(1e-12, self.best_delta)) and (tick_idx < self.best_tick):
+                    self.best_delta = delta
+                    self.best_z = z
+                    self.best_tick = tick_idx
+
         self.prev = z
 
     def snapshots(self) -> TickSnapshots:
-        # If best_z was never set (e.g., only one tick), fall back to last.
         z_star = self.best_z if self.best_z is not None else self.last_z
         return TickSnapshots(z_star=z_star, z_last=self.last_z)
 
@@ -166,6 +185,8 @@ class TickRepresentativeCollector:
         self.last_z = None
         self.best_tick = None
         self.last_tick = None
+        self.second_best_delta = -1.0
+        self.second_best_tick = None
 
     def t_star(self) -> Optional[int]:
         return self.best_tick if self.best_tick is not None else self.last_tick
@@ -597,6 +618,9 @@ def initialize_ctm_pairs(
 
     # Warmup pass
     tstars: List[int] = []
+    last_ticks: List[int] = []
+    best_deltas: List[float] = []
+    gap_fracs: List[float] = []
     with preserve_rng_state(seed_preserve), batchnorm_use_batch_stats_no_update(model), torch.inference_mode():
         it = iter(dataloader)
         for _ in tqdm(range(int(warmup_batches)), desc="Synchronization Init Warmup"):
@@ -619,6 +643,15 @@ def initialize_ctm_pairs(
             t_star = collector.t_star()
             if t_star is not None:
                 tstars.append(int(t_star))
+            if collector.last_tick is not None:
+                last_ticks.append(int(collector.last_tick))
+            if collector.best_delta >= 0:
+                best_deltas.append(float(collector.best_delta))
+                # gap fraction: (best - second_best)/best (0 means plateau)
+                if collector.second_best_delta >= 0 and collector.best_delta > 1e-12:
+                    gap_fracs.append(float((collector.best_delta - collector.second_best_delta) / collector.best_delta))
+                else:
+                    gap_fracs.append(1.0)  # only one delta available => “sharp”
             if snaps.z_star is None or snaps.z_last is None:
                 continue
 
@@ -662,10 +695,17 @@ def initialize_ctm_pairs(
     model.set_neuron_pairs("action", left_a, right_a)
     model.set_neuron_pairs("out", left_o, right_o)
 
-    t_arr = np.array(tstars, dtype=np.float32) if len(tstars) else np.array([0.0], dtype=np.float32)
+    t_arr = np.array(tstars, dtype=np.int32) if tstars else np.array([0], dtype=np.int32)
+    last_arr = np.array(last_ticks, dtype=np.int32) if last_ticks else np.array([0], dtype=np.int32)
     t_mean = float(t_arr.mean())
     t_std = float(t_arr.std())
-    t_extreme = float(((t_arr == t_arr.min()) | (t_arr == t_arr.max())).mean()) if len(tstars) else 0.0
+    # boundary extreme: t_star == 0 or t_star == (T-1), per batch
+    boundary_extreme = float(((t_arr == 0) | (t_arr == last_arr)).mean()) if tstars else 0.0
+    best_delta_mean = float(np.mean(best_deltas)) if best_deltas else float("nan")
+    gap_frac_mean = float(np.mean(gap_fracs)) if gap_fracs else float("nan")
+    gap_frac_p10 = float(np.percentile(gap_fracs, 10)) if gap_fracs else float("nan")
+    print(f"[warmup] best_delta_mean={best_delta_mean:.4f} gap_frac_mean={gap_frac_mean:.4f} gap_frac_p10={gap_frac_p10:.4f} boundary_extreme={boundary_extreme:.3f}")
+
 
     warm_diag = WarmupDiagnostics(
         warmup_batches=int(warmup_batches),
@@ -676,7 +716,6 @@ def initialize_ctm_pairs(
         reservoir_seen_out=int(res_out.n_seen),
         t_star_mean=t_mean,
         t_star_std=t_std,
-        t_star_extreme_frac=t_extreme,
     )
 
     role_diag_a = _pair_role_diagnostics(
@@ -763,7 +802,7 @@ def log_pair_init_diagnostics(warm: WarmupDiagnostics, roles: List[PairRoleDiagn
     log_fn(f"Warmup: batches={warm.warmup_batches}  reservoir_cap={warm.reservoir_capacity}")
     log_fn(f"Reservoir action: size={warm.reservoir_size_action} seen={warm.reservoir_seen_action}")
     log_fn(f"Reservoir out:    size={warm.reservoir_size_out} seen={warm.reservoir_seen_out}")
-    log_fn(f"t_star: mean={warm.t_star_mean:.2f} std={warm.t_star_std:.2f} extreme_frac={warm.t_star_extreme_frac:.3f}")
+    log_fn(f"t_star: mean={warm.t_star_mean:.2f} std={warm.t_star_std:.2f}")
     for r in roles:
         log_fn(f"[{r.role}] J={r.J} n_self={r.n_self} unique_pairs={r.unique_pair_frac:.3f} self_frac={r.self_pair_frac:.3f}")
         log_fn(f"[{r.role}] unique_neurons={r.unique_neurons} deg(min/med/max)={r.deg_min}/{r.deg_median:.1f}/{r.deg_max}")

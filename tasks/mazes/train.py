@@ -464,7 +464,7 @@ if __name__=='__main__':
 
             if sync_collector is not None:
                 sync_summary = sync_collector.summary()
-                t2_summary = summarize_max_certainty_tick(certs)
+                t2_summary = summarize_max_certainty_tick(certainties)
                 print(
                     f"[step {bi}] "
                     f"action_sync_std={sync_summary['action_sync_std_mean']:.4f} "
