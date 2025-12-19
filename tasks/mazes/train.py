@@ -14,7 +14,12 @@ from tqdm.auto import tqdm
 
 from data.custom_datasets import MazeImageFolder
 from models.ctm import ContinuousThoughtMachine
-from models.ctm_pairing_init import initialize_ctm_pairs, default_warmup_batches
+from models.ctm_pairing_init import (
+    initialize_ctm_pairs,
+    default_warmup_batches,
+    SyncStatsCollector,
+    summarize_max_certainty_tick,
+)
 from models.lstm import LSTMBaseline
 from models.ff import FFBaseline
 from tasks.mazes.plotting import make_maze_gif
@@ -232,6 +237,8 @@ if __name__=='__main__':
     num_workers_test = 1 # Defaulting to 1, can be changed
     trainloader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers_train, drop_last=True)
     testloader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size_test, shuffle=True, num_workers=num_workers_test, drop_last=False)
+    train_eval_loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size_test, shuffle=True, num_workers=num_workers_test) # Use consistent num_workers
+    test_eval_loader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size_test, shuffle=True, num_workers=num_workers_test)
 
     # For lazy modules so that we can get param count
     
@@ -379,6 +386,7 @@ if __name__=='__main__':
             upto_where_std = 0.0
             upto_where_min = -1
             upto_where_max = -1
+            sync_collector = SyncStatsCollector() if bi%args.track_every==0 else None
 
 
             # Model-specific forward, reshape, and loss calculation
@@ -388,7 +396,7 @@ if __name__=='__main__':
 
                 if args.model == 'ctm':
                     # CTM output: (B, SeqLength*5, Ticks), Certainties: (B, Ticks)
-                    predictions_raw, certainties, synchronisation = model(inputs)
+                    predictions_raw, certainties, synchronisation = model(inputs, sync_callback=sync_collector)
                     # Reshape predictions: (B, SeqLength, 5, Ticks)
                     predictions = predictions_raw.reshape(predictions_raw.size(0), -1, 5, predictions_raw.size(-1))
                     loss, where_most_certain, upto_where = maze_loss(predictions, certainties, targets, cirriculum_lookahead=args.cirriculum_lookahead, use_most_certain=True)
@@ -454,6 +462,17 @@ if __name__=='__main__':
 
             pbar.set_description(f'Dataset={args.dataset}. Model={args.model}. {pbar_desc}')
 
+            if sync_collector is not None:
+                sync_summary = sync_collector.summary()
+                t2_summary = summarize_max_certainty_tick(certs)
+                print(
+                    f"[step {bi}] "
+                    f"action_sync_std={sync_summary['action_sync_std_mean']:.4f} "
+                    f"out_sync_std={sync_summary['out_sync_std_mean']:.4f} "
+                    f"action_near0={sync_summary['action_sync_near_zero_frac']:.3f} "
+                    f"out_near0={sync_summary['out_sync_near_zero_frac']:.3f} "
+                    f"t2_mean={t2_summary['t2_mean']:.2f} t2_std={t2_summary['t2_std']:.2f}"
+                )
 
             # Metrics tracking and plotting
             if bi%args.track_every==0 and (bi != 0 or args.reload_model_only):
@@ -477,14 +496,13 @@ if __name__=='__main__':
 
                     # TRAIN METRICS
                     pbar.set_description('Tracking: Computing TRAIN metrics')
-                    loader = torch.utils.data.DataLoader(train_data, batch_size=args.batch_size_test, shuffle=True, num_workers=num_workers_test) # Use consistent num_workers
                     all_targets_list = []
                     all_predictions_list = [] # Per step/tick predictions argmax (N, S, T) or (N, S)
                     all_predictions_most_certain_list = [] # Predictions at chosen step/tick argmax (N, S)
                     all_losses = []
 
-                    with tqdm(total=len(loader), initial=0, leave=False, position=1, dynamic_ncols=True) as pbar_inner:
-                        for inferi, (inputs, targets) in enumerate(loader):
+                    with tqdm(total=len(train_eval_loader), initial=0, leave=False, position=1, dynamic_ncols=True) as pbar_inner:
+                        for inferi, (inputs, targets) in enumerate(train_eval_loader):
                             inputs = inputs.to(device)
                             targets = targets.to(device)
                             all_targets_list.append(targets.detach().cpu().numpy()) # N x S
@@ -541,14 +559,13 @@ if __name__=='__main__':
 
                     # TEST METRICS
                     pbar.set_description('Tracking: Computing TEST metrics')
-                    loader = torch.utils.data.DataLoader(test_data, batch_size=args.batch_size_test, shuffle=True, num_workers=num_workers_test)
                     all_targets_list = []
                     all_predictions_list = []
                     all_predictions_most_certain_list = []
                     all_losses = []
 
-                    with tqdm(total=len(loader), initial=0, leave=False, position=1, dynamic_ncols=True) as pbar_inner:
-                        for inferi, (inputs, targets) in enumerate(loader):
+                    with tqdm(total=len(test_eval_loader), initial=0, leave=False, position=1, dynamic_ncols=True) as pbar_inner:
+                        for inferi, (inputs, targets) in enumerate(test_eval_loader):
                             inputs = inputs.to(device)
                             targets = targets.to(device)
                             all_targets_list.append(targets.detach().cpu().numpy())

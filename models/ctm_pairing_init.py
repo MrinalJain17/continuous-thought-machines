@@ -9,9 +9,43 @@ from typing import Callable, Optional, Tuple, Iterable, Dict, Any, List
 import numpy as np
 import torch
 import torch.nn as nn
+from tqdm.auto import tqdm
 
 
 Tensor = torch.Tensor
+
+
+@dataclass
+class PairRoleDiagnostics:
+    role: str
+    J: int
+    n_self: int
+    unique_pair_frac: float
+    self_pair_frac: float
+    unique_neurons: int
+    deg_min: int
+    deg_median: float
+    deg_max: int
+    eta: float
+    alpha: float
+    k_eff: int
+    p_entropy_norm: float
+    d_max_final: int
+    d_max_increments: int
+    used_ultimate_fallback: bool
+
+
+@dataclass
+class WarmupDiagnostics:
+    warmup_batches: int
+    reservoir_capacity: int
+    reservoir_size_action: int
+    reservoir_size_out: int
+    reservoir_seen_action: int
+    reservoir_seen_out: int
+    t_star_mean: float
+    t_star_std: float
+    t_star_extreme_frac: float  # fraction of batches with t_star in {0, T-1}
 
 
 @contextlib.contextmanager
@@ -103,17 +137,21 @@ class TickRepresentativeCollector:
         self.best_delta: float = -1.0
         self.best_z: Optional[Tensor] = None
         self.last_z: Optional[Tensor] = None
+        self.best_tick: Optional[int] = None
+        self.last_tick: Optional[int] = None
 
     def __call__(self, tick_idx: int, activated_state: Tensor):
         # activated_state: (B, D)
         z = activated_state.detach()
         self.last_z = z
+        self.last_tick = tick_idx
         if self.prev is not None:
             # Δ_t = mean over batch of L2 norm of step difference
             delta = (z - self.prev).norm(dim=1).mean().item()
             if delta > self.best_delta:
                 self.best_delta = delta
                 self.best_z = z
+                self.best_tick = tick_idx
         self.prev = z
 
     def snapshots(self) -> TickSnapshots:
@@ -126,6 +164,11 @@ class TickRepresentativeCollector:
         self.best_delta = -1.0
         self.best_z = None
         self.last_z = None
+        self.best_tick = None
+        self.last_tick = None
+
+    def t_star(self) -> Optional[int]:
+        return self.best_tick if self.best_tick is not None else self.last_tick
 
 
 class WelfordStats:
@@ -312,7 +355,8 @@ def sample_pairs_from_factors(
     L: int = 64,
     max_attempts: int = 64,
     global_attempts_mult: int = 10,
-) -> Tuple[Tensor, Tensor]:
+    return_info: bool = False,
+) -> Tuple[Tensor, Tensor] | Tuple[Tensor, Tensor, Dict[str, Any]]:
     """Sample J pairs (left,right) using degree-capped, correlation-guided sampling with termination guarantees."""
     J = int(J)
     n_self = int(min(n_self, J))
@@ -366,6 +410,9 @@ def sample_pairs_from_factors(
 
     # Degree cap over candidates (for non-self pairs)
     d_max = int(math.ceil(2 * max(1, J) / max(1, M)))
+    d_max_start = d_max
+    d_max_increments = 0
+    used_ultimate_fallback = False
 
     total_attempts = 0
     target_nonself = J - n_self
@@ -418,6 +465,7 @@ def sample_pairs_from_factors(
                 used.add((i_g, j_g))
                 left_pairs.append(i_g)
                 right_pairs.append(j_g)
+            used_ultimate_fallback = True
             break
 
         # sample left endpoint among candidates
@@ -466,6 +514,7 @@ def sample_pairs_from_factors(
 
         # 2) relax degree cap minimally
         d_max += 1
+        d_max_increments += 1
         # try once more with relaxed cap
         j_c = _choose_uniform_unsat(exclude_i=i_c)
         if j_c is not None and _accept(i_c, j_c):
@@ -473,6 +522,16 @@ def sample_pairs_from_factors(
 
     left = torch.tensor(left_pairs[:J], device=device, dtype=torch.long)
     right = torch.tensor(right_pairs[:J], device=device, dtype=torch.long)
+
+    if return_info:
+        info = {
+            "d_max_start": d_max_start,
+            "d_max_final": d_max,
+            "d_max_increments": d_max_increments,
+            "used_ultimate_fallback": used_ultimate_fallback,
+        }
+        return left, right, info
+
     return left, right
 
 
@@ -537,9 +596,10 @@ def initialize_ctm_pairs(
     collector = TickRepresentativeCollector()
 
     # Warmup pass
+    tstars: List[int] = []
     with preserve_rng_state(seed_preserve), batchnorm_use_batch_stats_no_update(model), torch.inference_mode():
         it = iter(dataloader)
-        for _ in range(int(warmup_batches)):
+        for _ in tqdm(range(int(warmup_batches)), desc="Synchronization Init Warmup"):
             try:
                 batch = next(it)
             except StopIteration:
@@ -556,6 +616,9 @@ def initialize_ctm_pairs(
             _ = model(x, track=False, callback=collector)  # forward only
 
             snaps = collector.snapshots()
+            t_star = collector.t_star()
+            if t_star is not None:
+                tstars.append(int(t_star))
             if snaps.z_star is None or snaps.z_last is None:
                 continue
 
@@ -576,23 +639,177 @@ def initialize_ctm_pairs(
     L_a = min(64, max(0, min(d, 4 * factors_action.k_eff) - 1))
     L_o = min(64, max(0, min(d, 4 * factors_out.k_eff) - 1))
 
-    left_a, right_a = sample_pairs_from_factors(
+    left_a, right_a, info_a = sample_pairs_from_factors(
         factors=factors_action,
         J=J_action,
         n_self=n_random_pairing_self,
         d=d,
         device=device,
         L=L_a,
+        return_info=True,
     )
-    left_o, right_o = sample_pairs_from_factors(
+    left_o, right_o, info_o = sample_pairs_from_factors(
         factors=factors_out,
         J=J_out,
         n_self=n_random_pairing_self,
         d=d,
         device=device,
         L=L_o,
+        return_info=True,
     )
 
     # Write into model buffers once
     model.set_neuron_pairs("action", left_a, right_a)
     model.set_neuron_pairs("out", left_o, right_o)
+
+    t_arr = np.array(tstars, dtype=np.float32) if len(tstars) else np.array([0.0], dtype=np.float32)
+    t_mean = float(t_arr.mean())
+    t_std = float(t_arr.std())
+    t_extreme = float(((t_arr == t_arr.min()) | (t_arr == t_arr.max())).mean()) if len(tstars) else 0.0
+
+    warm_diag = WarmupDiagnostics(
+        warmup_batches=int(warmup_batches),
+        reservoir_capacity=int(n_res),
+        reservoir_size_action=int(res_action.size),
+        reservoir_size_out=int(res_out.size),
+        reservoir_seen_action=int(res_action.n_seen),
+        reservoir_seen_out=int(res_out.n_seen),
+        t_star_mean=t_mean,
+        t_star_std=t_std,
+        t_star_extreme_frac=t_extreme,
+    )
+
+    role_diag_a = _pair_role_diagnostics(
+        role="action",
+        left=left_a, right=right_a,
+        J=J_action, n_self=n_random_pairing_self, d=d,
+        factors=factors_action, sampler_info=info_a,
+    )
+    role_diag_o = _pair_role_diagnostics(
+        role="out",
+        left=left_o, right=right_o,
+        J=J_out, n_self=n_random_pairing_self, d=d,
+        factors=factors_out, sampler_info=info_o,
+    )
+
+    log_pair_init_diagnostics(warm_diag, [role_diag_a, role_diag_o], log_fn=print)
+
+
+def _entropy_normalized(p: Tensor, eps: float = 1e-12) -> float:
+    p = p.detach().float()
+    p = (p + eps) / (p.sum() + eps)
+    H = -(p * (p + eps).log()).sum().item()
+    return float(H / math.log(p.numel() + 1e-12))
+
+
+def _pair_role_diagnostics(
+    role: str,
+    left: Tensor,
+    right: Tensor,
+    J: int,
+    n_self: int,
+    d: int,
+    factors: LowRankFactors,
+    sampler_info: Dict[str, Any],
+) -> PairRoleDiagnostics:
+    left = left.detach().cpu()
+    right = right.detach().cpu()
+
+    pairs = torch.stack([left, right], dim=1)  # (J,2)
+    unique_pairs = torch.unique(pairs, dim=0).shape[0]
+    unique_pair_frac = float(unique_pairs / max(1, J))
+
+    self_ct = int((left == right).sum().item())
+    self_pair_frac = float(self_ct / max(1, J))
+
+    touched = torch.unique(torch.cat([left, right], dim=0))
+    unique_neurons = int(touched.numel())
+
+    deg = torch.bincount(torch.cat([left, right]), minlength=d)  # degree counts
+    deg_nonzero = deg[deg > 0]
+    if deg_nonzero.numel() == 0:
+        deg_min, deg_med, deg_max = 0, 0.0, 0
+    else:
+        deg_min = int(deg_nonzero.min().item())
+        deg_max = int(deg_nonzero.max().item())
+        deg_med = float(deg_nonzero.median().item())
+
+    eta = float(factors.eta)
+    alpha = float(max(0.0, min(1.0, 1.0 - eta)))
+    p_ent = _entropy_normalized(factors.p.cpu())
+
+    return PairRoleDiagnostics(
+        role=role,
+        J=int(J),
+        n_self=int(min(n_self, J)),
+        unique_pair_frac=unique_pair_frac,
+        self_pair_frac=self_pair_frac,
+        unique_neurons=unique_neurons,
+        deg_min=deg_min,
+        deg_median=deg_med,
+        deg_max=deg_max,
+        eta=eta,
+        alpha=alpha,
+        k_eff=int(factors.k_eff),
+        p_entropy_norm=p_ent,
+        d_max_final=int(sampler_info.get("d_max_final", -1)),
+        d_max_increments=int(sampler_info.get("d_max_increments", 0)),
+        used_ultimate_fallback=bool(sampler_info.get("used_ultimate_fallback", False)),
+    )
+
+
+def log_pair_init_diagnostics(warm: WarmupDiagnostics, roles: List[PairRoleDiagnostics], log_fn: Callable[[str], None] = print) -> None:
+    log_fn("=== CTM Pair Initialization Diagnostics ===")
+    log_fn(f"Warmup: batches={warm.warmup_batches}  reservoir_cap={warm.reservoir_capacity}")
+    log_fn(f"Reservoir action: size={warm.reservoir_size_action} seen={warm.reservoir_seen_action}")
+    log_fn(f"Reservoir out:    size={warm.reservoir_size_out} seen={warm.reservoir_seen_out}")
+    log_fn(f"t_star: mean={warm.t_star_mean:.2f} std={warm.t_star_std:.2f} extreme_frac={warm.t_star_extreme_frac:.3f}")
+    for r in roles:
+        log_fn(f"[{r.role}] J={r.J} n_self={r.n_self} unique_pairs={r.unique_pair_frac:.3f} self_frac={r.self_pair_frac:.3f}")
+        log_fn(f"[{r.role}] unique_neurons={r.unique_neurons} deg(min/med/max)={r.deg_min}/{r.deg_median:.1f}/{r.deg_max}")
+        log_fn(f"[{r.role}] k_eff={r.k_eff} eta={r.eta:.3f} alpha={r.alpha:.3f} H(p)/logD={r.p_entropy_norm:.3f}")
+        log_fn(f"[{r.role}] d_max_final={r.d_max_final} increments={r.d_max_increments} ultimate_fallback={r.used_ultimate_fallback}")
+
+
+class SyncStatsCollector:
+    """Collect per-batch sync health stats without storing full traces."""
+    def __init__(self, near_zero_tol: float = 1e-3):
+        self.near_zero_tol = near_zero_tol
+        self._stds: Dict[str, float] = {}
+        self._near_zero_frac: Dict[str, float] = {}
+        self._last_tick: int = -1
+
+    def __call__(self, tick_idx: int, role: str, sync_vec: Tensor):
+        # sync_vec: (B, J)
+        self._last_tick = tick_idx
+        # Only keep last observed tick per role (cheap, and matches "health at current compute step")
+        std = sync_vec.detach().float().std(dim=0)  # (J,)
+        self._stds[role] = float(std.mean().item())
+        self._near_zero_frac[role] = float((std < self.near_zero_tol).float().mean().item())
+
+    def summary(self) -> Dict[str, Any]:
+        return {
+            "last_tick": self._last_tick,
+            "action_sync_std_mean": self._stds.get("action", float("nan")),
+            "out_sync_std_mean": self._stds.get("out", float("nan")),
+            "action_sync_near_zero_frac": self._near_zero_frac.get("action", float("nan")),
+            "out_sync_near_zero_frac": self._near_zero_frac.get("out", float("nan")),
+        }
+
+
+def summarize_max_certainty_tick(certainties: Any) -> Dict[str, float]:
+    """Return mean/std of argmax certainty tick across batch."""
+    if isinstance(certainties, list):
+        cert = torch.stack([c.detach() for c in certainties], dim=1)  # (B,T)
+    else:
+        cert = certainties.detach()
+        if cert.dim() == 2:
+            pass
+        elif cert.dim() == 3:
+            # If model returns (T,B,...) style, try to coerce; keep conservative:
+            cert = cert.squeeze(-1)
+        else:
+            return {"t2_mean": float("nan"), "t2_std": float("nan")}
+
+    t2 = cert.argmax(dim=1).float()  # (B,)
+    return {"t2_mean": float(t2.mean().item()), "t2_std": float(t2.std(unbiased=False).item())}

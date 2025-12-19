@@ -565,7 +565,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
 
 
 
-    def forward(self, x, track=False, callback=None):
+    def forward(self, x, track=False, callback=None, sync_callback=None):
         B = x.size(0)
         device = x.device
 
@@ -602,6 +602,8 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
 
             # --- Calculate Synchronisation for Input Data Interaction ---
             synchronisation_action, decay_alpha_action, decay_beta_action = self.compute_synchronisation(activated_state, decay_alpha_action, decay_beta_action, r_action, synch_type='action')
+            if sync_callback is not None:
+                sync_callback(stepi, "action", synchronisation_action)
 
             # --- Interact with Data via Attention ---
             q = self.q_proj(synchronisation_action).unsqueeze(1)
@@ -616,15 +618,16 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
 
             # --- Apply Neuron-Level Models ---
             activated_state = self.trace_processor(state_trace)
-
-            if callback is not None:
-                callback(stepi, activated_state)
             # One would also keep an 'activated_state_trace' as the history of outgoing post-activations
             # BUT, this is unnecessary because the synchronisation calculation is fully linear and can be
             # done using only the currect activated state (see compute_synchronisation method for explanation)
+            if callback is not None:
+                callback(stepi, activated_state)
 
             # --- Calculate Synchronisation for Output Predictions ---
             synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, decay_alpha_out, decay_beta_out, r_out, synch_type='out')
+            if sync_callback is not None:
+                sync_callback(stepi, "out", synchronisation_out)
 
             # --- Get Predictions and Certainties ---
             current_prediction = self.output_projector(synchronisation_out)
