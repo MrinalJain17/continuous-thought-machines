@@ -21,7 +21,7 @@ from models.ctm_pairing_init import (
     preserve_rng_state,
     TickRepresentativeCollector,
 )
-from models.ctm_stats_collector import CTMStatsCollector, SyncTickCollector
+from models.ctm_stats import CTMStatsCollector, SyncTickCollector
 from models.lstm import LSTMBaseline
 from models.ff import FFBaseline
 from tasks.mazes.plotting import make_maze_gif
