@@ -138,6 +138,61 @@ def test_set_synchronisation_parameters(ctm_factory, base_params, device, synch_
     elif neuron_select_type == "random-pairing":
         assert torch.equal(right[:num_random_pairing_self], left[:num_random_pairing_self])
 
+
+def test_pair_init_invariants_cpu(ctm_factory, base_params, device):
+    torch.manual_seed(0); np.random.seed(0); random.seed(0)
+    model = ctm_factory(
+        base_params,
+        d_model=64,
+        n_synch_out=8,
+        n_synch_action=8,
+        neuron_select_type="random-pairing",
+        n_random_pairing_self=2,
+    ).to(device)
+    dl = [GOLDEN_TEST_INPUT_PARITY] * 8  # tiny iterable is fine
+
+    diag = initialize_ctm_pairs(model, dl, warmup_batches=8, n_random_pairing_self=2, preserve_seed=True)
+
+    for role in ["action", "out"]:
+        left = model.get_neuron_pairs(role)[0].cpu().numpy()
+        right = model.get_neuron_pairs(role)[1].cpu().numpy()
+        J = getattr(model, f"n_synch_{role}")
+        D = model.d_model
+        n_self = 2
+
+        assert left.shape == (J,)
+        assert right.shape == (J,)
+        assert left.min() >= 0 and left.max() < D
+        assert right.min() >= 0 and right.max() < D
+        assert np.all(left[:n_self] == right[:n_self])
+        assert np.all(left[n_self:] != right[n_self:])
+        assert len(set(zip(left.tolist(), right.tolist()))) == J
+
+
+def test_warmup_does_not_change_bn_running_stats(ctm_factory, base_params, device):
+    model = ctm_factory(
+        base_params,
+        d_model=64,
+        n_synch_out=8,
+        n_synch_action=8,
+        neuron_select_type="random-pairing",
+        n_random_pairing_self=2,
+    ).to(device)
+    bn_before = [(m.running_mean.clone(), m.running_var.clone(), m.num_batches_tracked.clone())
+                 for m in model.modules() if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatchNorm))]
+
+    dl = [GOLDEN_TEST_INPUT_PARITY] * 8
+    initialize_ctm_pairs(model, dl, warmup_batches=8, n_random_pairing_self=0, preserve_seed=True)
+
+    bn_after = [(m.running_mean, m.running_var, m.num_batches_tracked)
+                for m in model.modules() if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatchNorm))]
+
+    for (m0,v0,n0), (m1,v1,n1) in zip(bn_before, bn_after):
+        torch.testing.assert_close(m0, m1)
+        torch.testing.assert_close(v0, v1)
+        torch.testing.assert_close(n0, n1)
+
+
 # ------ Neuron Select Type Test ---
 
 @pytest.mark.parametrize("neuron_select_type", VALID_NEURON_SELECT_TYPES)
