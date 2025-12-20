@@ -3,6 +3,7 @@ import pytest
 import itertools
 from models.constants import VALID_NEURON_SELECT_TYPES, VALID_BACKBONE_TYPES, VALID_POSITIONAL_EMBEDDING_TYPES
 import numpy as np
+import random
 
 def rep_size(neuron_select_type: str, n_synch: int) -> int:
     return n_synch if neuron_select_type == "random-pairing" else n_synch * (n_synch + 1) // 2
