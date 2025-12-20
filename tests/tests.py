@@ -140,7 +140,7 @@ def test_set_synchronisation_parameters(ctm_factory, base_params, device, synch_
         assert torch.equal(right[:num_random_pairing_self], left[:num_random_pairing_self])
 
 
-def test_pair_init_invariants_cpu(ctm_factory, base_params):
+def test_pair_init_invariants_cpu(ctm_factory, base_params, golden_test_input_parity):
     torch.manual_seed(0); np.random.seed(0); random.seed(0)
     model = ctm_factory(
         base_params,
@@ -150,7 +150,7 @@ def test_pair_init_invariants_cpu(ctm_factory, base_params):
         neuron_select_type="random-pairing",
         n_random_pairing_self=2,
     ).to("cpu")
-    dl = [GOLDEN_TEST_INPUT_PARITY] * 8  # tiny iterable is fine
+    dl = [golden_test_input_parity] * 8  # tiny iterable is fine
 
     diag = initialize_ctm_pairs(model, dl, warmup_batches=8, n_random_pairing_self=2, preserve_seed=True)
 
@@ -170,7 +170,7 @@ def test_pair_init_invariants_cpu(ctm_factory, base_params):
         assert len(set(zip(left.tolist(), right.tolist()))) == J
 
 
-def test_warmup_does_not_change_bn_running_stats(ctm_factory, base_params):
+def test_warmup_does_not_change_bn_running_stats(ctm_factory, base_params, golden_test_input_parity):
     model = ctm_factory(
         base_params,
         d_model=64,
@@ -182,7 +182,7 @@ def test_warmup_does_not_change_bn_running_stats(ctm_factory, base_params):
     bn_before = [(m.running_mean.clone(), m.running_var.clone(), m.num_batches_tracked.clone())
                  for m in model.modules() if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatchNorm))]
 
-    dl = [GOLDEN_TEST_INPUT_PARITY] * 8
+    dl = [golden_test_input_parity] * 8
     initialize_ctm_pairs(model, dl, warmup_batches=8, n_random_pairing_self=0, preserve_seed=True)
 
     bn_after = [(m.running_mean, m.running_var, m.num_batches_tracked)
