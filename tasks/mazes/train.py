@@ -17,9 +17,11 @@ from models.ctm import ContinuousThoughtMachine
 from models.ctm_pairing_init import (
     initialize_ctm_pairs,
     default_warmup_batches,
-    SyncStatsCollector,
-    summarize_max_certainty_tick,
+    batchnorm_use_batch_stats_no_update,
+    preserve_rng_state,
+    TickRepresentativeCollector,
 )
+from models.ctm_stats_collector import CTMStatsCollector, SyncTickCollector
 from models.lstm import LSTMBaseline
 from models.ff import FFBaseline
 from tasks.mazes.plotting import make_maze_gif
@@ -340,16 +342,50 @@ if __name__=='__main__':
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-    # One-shot CTM pairing initialization (task-agnostic).
-    # Run before torch.compile to avoid recompilations / graph breaks when resampling indices during warmup.
-    if args.model == 'ctm' and (not args.reload) and args.neuron_select_type == 'random-pairing':
-        warmup_batches = default_warmup_batches(getattr(args, 'warmup_steps', 0))
-        initialize_ctm_pairs(
-            model=model,
-            dataloader=trainloader,
-            warmup_batches=warmup_batches,
-            n_random_pairing_self=getattr(args, 'n_random_pairing_self', 0),
-        )
+    ctm_stats = None
+    tick_health = None
+    sync_health = None
+
+    if args.model == "ctm":
+        ctm_stats = CTMStatsCollector(log_fn=print)
+        tick_health = TickRepresentativeCollector()
+        sync_health = SyncTickCollector()  # collects sync per tick via sync_callback
+
+        # Only do one-shot init on fresh runs and only for random-pairing mode
+        if (not args.reload) and (args.neuron_select_type == "random-pairing"):
+            warm_batches = default_warmup_batches(getattr(args, "warmup_steps", 0))
+            init_diag = initialize_ctm_pairs(
+                model=model,
+                dataloader=trainloader,
+                warmup_batches=warm_batches,
+                n_random_pairing_self=getattr(args, "n_random_pairing_self", 0),
+                batch_to_x=lambda batch: batch[0],  # mazes: (inputs, targets)
+                seed_preserve=True,
+            )
+
+            # One-time init diagnostics: pairing structure + init diagnostics returned by initializer
+            role_stats = {
+                "action": ctm_stats.pairing_graph_stats(
+                    "action",
+                    model.action_neuron_indices_left,
+                    model.action_neuron_indices_right,
+                    n_self=getattr(args, "n_random_pairing_self", 0),
+                ),
+                "out": ctm_stats.pairing_graph_stats(
+                    "out",
+                    model.out_neuron_indices_left,
+                    model.out_neuron_indices_right,
+                    n_self=getattr(args, "n_random_pairing_self", 0),
+                ),
+            }
+            ctm_stats.log_init(init_diag if init_diag is not None else {}, role_stats)
+
+            # Optional (init-time only): export edge lists for Gephi
+            ctm_stats.export_gephi_csv(f"{args.log_dir}/pair_graph_action.csv", "action",
+                                       model.action_neuron_indices_left, model.action_neuron_indices_right)
+            ctm_stats.export_gephi_csv(f"{args.log_dir}/pair_graph_out.csv", "out",
+                                       model.out_neuron_indices_left, model.out_neuron_indices_right)
+    
 
 
     if args.do_compile:
@@ -386,8 +422,7 @@ if __name__=='__main__':
             upto_where_std = 0.0
             upto_where_min = -1
             upto_where_max = -1
-            sync_collector = SyncStatsCollector() if bi%args.track_every==0 else None
-
+            do_health = (ctm_stats is not None) and (bi % args.track_every == 0)
 
             # Model-specific forward, reshape, and loss calculation
             with torch.autocast(device_type="cuda" if "cuda" in device else "cpu", dtype=torch.float16, enabled=args.use_amp):
@@ -396,7 +431,7 @@ if __name__=='__main__':
 
                 if args.model == 'ctm':
                     # CTM output: (B, SeqLength*5, Ticks), Certainties: (B, Ticks)
-                    predictions_raw, certainties, synchronisation = model(inputs, sync_callback=sync_collector)
+                    predictions_raw, certainties, synchronisation = model(inputs)
                     # Reshape predictions: (B, SeqLength, 5, Ticks)
                     predictions = predictions_raw.reshape(predictions_raw.size(0), -1, 5, predictions_raw.size(-1))
                     loss, where_most_certain, upto_where = maze_loss(predictions, certainties, targets, cirriculum_lookahead=args.cirriculum_lookahead, use_most_certain=True)
@@ -443,6 +478,35 @@ if __name__=='__main__':
 
 
             scaler.scale(loss).backward()
+            if do_health:
+                tick_health.reset()
+                sync_health.reset()
+
+                # Separate diagnostic forward for stable health metrics (dropout-free, BN-safe)
+                with preserve_rng_state(True), torch.inference_mode(), batchnorm_use_batch_stats_no_update(model):
+                    _pred_raw_h, cert_h, _sync_h = model(
+                        inputs,
+                        track=False,
+                        callback=tick_health,          # per-tick activated_state hook
+                        sync_callback=sync_health,     # per-tick sync hook ("action"/"out")
+                    )
+
+                snaps = tick_health.snapshots()
+                t_star = tick_health.t_star()
+                t_star_i = int(t_star) if t_star is not None else None
+
+                s_action_star = sync_health.get("action", t_star_i)
+                s_out_star = sync_health.get("out", t_star_i)
+
+                if (snaps.z_star is not None) and (s_action_star is not None) and (s_out_star is not None):
+                    health = ctm_stats.compute_health(
+                        z=snaps.z_star,
+                        s_action=s_action_star,
+                        s_out=s_out_star,
+                        certainties=cert_h,
+                        t_star=t_star_i,
+                    )
+                    ctm_stats.log_health(bi, health)
 
             if args.gradient_clipping!=-1: 
                 scaler.unscale_(optimizer)
@@ -462,17 +526,6 @@ if __name__=='__main__':
 
             pbar.set_description(f'Dataset={args.dataset}. Model={args.model}. {pbar_desc}')
 
-            if sync_collector is not None:
-                sync_summary = sync_collector.summary()
-                t2_summary = summarize_max_certainty_tick(certainties)
-                print(
-                    f"[step {bi}] "
-                    f"action_sync_std={sync_summary['action_sync_std_mean']:.4f} "
-                    f"out_sync_std={sync_summary['out_sync_std_mean']:.4f} "
-                    f"action_near0={sync_summary['action_sync_near_zero_frac']:.3f} "
-                    f"out_near0={sync_summary['out_sync_near_zero_frac']:.3f} "
-                    f"t2_mean={t2_summary['t2_mean']:.2f} t2_std={t2_summary['t2_std']:.2f}"
-                )
 
             # Metrics tracking and plotting
             if bi%args.track_every==0 and (bi != 0 or args.reload_model_only):

@@ -4,52 +4,32 @@ import contextlib
 import math
 import random
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple, Iterable, Dict, Any, List
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 from tqdm.auto import tqdm
+from sklearn.preprocessing import StandardScaler
+from sklearn.utils.extmath import randomized_svd
 
 
 Tensor = torch.Tensor
 
 
-@dataclass
-class PairRoleDiagnostics:
-    role: str
-    J: int
-    n_self: int
-    unique_pair_frac: float
-    self_pair_frac: float
-    unique_neurons: int
-    deg_min: int
-    deg_median: float
-    deg_max: int
-    eta: float
-    alpha: float
-    k_eff: int
-    p_entropy_norm: float
-    d_max_final: int
-    d_max_increments: int
-    used_ultimate_fallback: bool
-
-
-@dataclass
-class WarmupDiagnostics:
-    warmup_batches: int
-    reservoir_capacity: int
-    reservoir_size_action: int
-    reservoir_size_out: int
-    reservoir_seen_action: int
-    reservoir_seen_out: int
-    t_star_mean: float
-    t_star_std: float
-
+# ---------------------------------------------------------------------------
+# 1) Warmup forward mode
+# ---------------------------------------------------------------------------
 
 @contextlib.contextmanager
 def preserve_rng_state(enabled: bool = True):
-    """Preserve and restore RNG states for torch / numpy / python."""
+    """Preserve and restore RNG states for python/numpy/torch (+cuda).
+
+    Rationale:
+      Pair initialization should not accidentally perturb training randomness
+      (data augmentation, dropout, etc.). This context keeps init "side-effect-free"
+      with respect to RNG streams when enabled.
+    """
     if not enabled:
         yield
         return
@@ -69,26 +49,25 @@ def preserve_rng_state(enabled: bool = True):
 
 @contextlib.contextmanager
 def batchnorm_use_batch_stats_no_update(model: nn.Module):
-    """Warmup mode: Dropout OFF, BN uses batch stats, BN buffers unchanged.
+    """Warmup mode that avoids polluting correlations with dropout but keeps BN realistic.
 
-    - Forces model.eval() (disables Dropout).
-    - Forces BN layers into train mode so they use batch statistics.
-    - Prevents BN running_mean/var updates by setting momentum=0.0.
-    - Snapshots/restores BN buffers + training flags.
-    - Restores the model's original train/eval state.
+    Goal:
+      Warmup should approximate training-time forward activations (BN batch stats),
+      but must not mutate BN running_mean/var (to remain minimally invasive).
+
+    Mechanism:
+      - set model.eval() to disable dropout and other train-time stochasticity
+      - force BN modules into train mode so they use batch stats
+      - set BN momentum=0 to avoid running-stat drift
+      - snapshot/restore BN buffers and training flags
     """
     saved_bn: List[Tuple[nn.Module, Dict[str, Any]]] = []
     model_training = model.training
     try:
-        # Disable dropout and other train-time stochasticity globally.
         model.eval()
-
         for m in model.modules():
             if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatchNorm)):
-                st: Dict[str, Any] = {
-                    "training": m.training,
-                    "momentum": m.momentum,
-                }
+                st: Dict[str, Any] = {"training": m.training, "momentum": m.momentum}
                 if getattr(m, "running_mean", None) is not None:
                     st["running_mean"] = m.running_mean.detach().clone()
                 if getattr(m, "running_var", None) is not None:
@@ -96,15 +75,10 @@ def batchnorm_use_batch_stats_no_update(model: nn.Module):
                 if getattr(m, "num_batches_tracked", None) is not None:
                     st["num_batches_tracked"] = m.num_batches_tracked.detach().clone()
                 saved_bn.append((m, st))
-
-                # Use batch stats.
                 m.train(True)
-                # Avoid drifting running stats.
                 m.momentum = 0.0
-
         yield
     finally:
-        # Restore BN module state.
         for m, st in saved_bn:
             m.train(st["training"])
             m.momentum = st["momentum"]
@@ -114,69 +88,38 @@ def batchnorm_use_batch_stats_no_update(model: nn.Module):
                 m.running_var.copy_(st["running_var"])
             if "num_batches_tracked" in st:
                 m.num_batches_tracked.copy_(st["num_batches_tracked"])
-
-        # Restore overall model mode.
         model.train(model_training)
 
 
+# ---------------------------------------------------------------------------
+# 2) Tick representative snapshots: Z_star (max-change) and Z_last
+# ---------------------------------------------------------------------------
+
 @dataclass
 class TickSnapshots:
-    z_star: Optional[Tensor] = None
-    z_last: Optional[Tensor] = None
+    z_star: Optional[Tensor]
+    z_last: Optional[Tensor]
+    t_star: Optional[int]
+    t_last: Optional[int]
 
 
 class TickRepresentativeCollector:
-    """Select Z_star (max change) and Z_last (final tick) per forward pass.
+    """Select representative internal ticks without storing all ticks.
 
-    Callback is invoked once per internal tick with (tick_idx, activated_state),
-    where activated_state is the post-update state for that tick.
+    We want a label-free, task-agnostic snapshot that captures *dynamics*.
+    A simple and robust proxy is:
+      Z_star := state at tick with maximal step-to-step change (mean L2 over batch)
+      Z_last := state at final tick
+
+    This requires only streaming comparison with the previous tick.
     """
-    def __init__(self, tie_rtol: float = 1e-3):
-        self.tie_rtol = tie_rtol  # deterministic tie handling for near-plateaus
+    def __init__(self):
         self.prev: Optional[Tensor] = None
         self.best_delta: float = -1.0
         self.best_z: Optional[Tensor] = None
         self.last_z: Optional[Tensor] = None
         self.best_tick: Optional[int] = None
         self.last_tick: Optional[int] = None
-
-        # Track second best to measure plateau/ties
-        self.second_best_delta: float = -1.0
-        self.second_best_tick: Optional[int] = None
-
-    def __call__(self, tick_idx: int, activated_state: Tensor):
-        z = activated_state.detach()
-        self.last_z = z
-        self.last_tick = tick_idx
-
-        if self.prev is not None:
-            delta = (z - self.prev).norm(dim=1).mean().item()
-
-            # Update top-2 deltas (for diagnostics)
-            if delta > self.best_delta:
-                self.second_best_delta = self.best_delta
-                self.second_best_tick = self.best_tick
-                self.best_delta = delta
-                self.best_z = z
-                self.best_tick = tick_idx
-            elif delta > self.second_best_delta:
-                self.second_best_delta = delta
-                self.second_best_tick = tick_idx
-
-            # Deterministic tie handling: if near-plateau, prefer the earlier tick
-            # (keeps selection stable and avoids "always the latest in a plateau")
-            if self.best_tick is not None and self.second_best_delta >= 0:
-                # If current delta is within rtol of best and earlier, pick it
-                if (abs(delta - self.best_delta) <= self.tie_rtol * max(1e-12, self.best_delta)) and (tick_idx < self.best_tick):
-                    self.best_delta = delta
-                    self.best_z = z
-                    self.best_tick = tick_idx
-
-        self.prev = z
-
-    def snapshots(self) -> TickSnapshots:
-        z_star = self.best_z if self.best_z is not None else self.last_z
-        return TickSnapshots(z_star=z_star, z_last=self.last_z)
 
     def reset(self):
         self.prev = None
@@ -185,381 +128,381 @@ class TickRepresentativeCollector:
         self.last_z = None
         self.best_tick = None
         self.last_tick = None
-        self.second_best_delta = -1.0
-        self.second_best_tick = None
 
-    def t_star(self) -> Optional[int]:
-        return self.best_tick if self.best_tick is not None else self.last_tick
+    def __call__(self, tick_idx: int, activated_state: Tensor):
+        z = activated_state.detach()
+        self.last_z = z
+        self.last_tick = tick_idx
+        if self.prev is not None:
+            delta = (z - self.prev).norm(dim=1).mean().item()
+            if delta > self.best_delta:
+                self.best_delta = delta
+                self.best_z = z
+                self.best_tick = tick_idx
+        self.prev = z
+
+    def snapshots(self) -> TickSnapshots:
+        z_star = self.best_z if self.best_z is not None else self.last_z
+        t_star = self.best_tick if self.best_tick is not None else self.last_tick
+        return TickSnapshots(z_star=z_star, z_last=self.last_z, t_star=t_star, t_last=self.last_tick)
 
 
-class WelfordStats:
-    """Streaming mean/variance (per-dimension) using Welford, with batch combine."""
-    def __init__(self, d: int, device: torch.device):
-        self.count = 0
-        self.mean = torch.zeros(d, device=device, dtype=torch.float64)
-        self.M2 = torch.zeros(d, device=device, dtype=torch.float64)
+# ---------------------------------------------------------------------------
+# 3) Streaming standardization + reservoir sampling
+# ---------------------------------------------------------------------------
 
-    def update_batch(self, X: Tensor):
-        """Update from X: (B, D) float32 on self.mean.device."""
-        if X.numel() == 0:
-            return
-        X64 = X.to(dtype=torch.float64)
-        b = X64.shape[0]
-
-        batch_mean = X64.mean(dim=0)
-        batch_M2 = ((X64 - batch_mean) ** 2).sum(dim=0)
-
-        if self.count == 0:
-            self.count = b
-            self.mean.copy_(batch_mean)
-            self.M2.copy_(batch_M2)
-            return
-
-        n = self.count
-        n_new = n + b
-        delta = batch_mean - self.mean
-        self.mean += delta * (b / n_new)
-        self.M2 += batch_M2 + (delta * delta) * (n * b / n_new)
-        self.count = n_new
-
-    def finalize(self) -> Tuple[Tensor, Tensor]:
-        if self.count < 2:
-            var = torch.ones_like(self.mean)
-        else:
-            var = self.M2 / (self.count - 1)
-        std = torch.sqrt(var.clamp_min(1e-12))
-        return self.mean.to(dtype=torch.float32), std.to(dtype=torch.float32)
-
+def _rms_normalize_rows(z: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    """Row-wise RMS normalization: z / sqrt(mean(z^2)+eps)."""
+    rms = np.sqrt(np.mean(z * z, axis=1, keepdims=True) + eps)
+    return z / rms
 
 
 class Reservoir:
-    """Uniform reservoir sampler for rows in R^D, plus running stats over all seen rows."""
-    def __init__(self, d: int, capacity: int, device: torch.device):
-        self.d = d
+    """Uniform reservoir sampler over rows, with streaming standardization via sklearn.
+
+    Mental model:
+      We need a stable low-rank Gram proxy. That requires:
+        (a) many activation samples,
+        (b) robust standardization,
+        (c) bounded memory.
+
+      We therefore:
+        - RMS-normalize each row to damp scale drift
+        - update a StandardScaler online (mean/var over all seen rows)
+        - retain a uniform reservoir sample of fixed size for PCA/SVD
+
+    This gives a dataset-agnostic activation matrix X without storing everything.
+    """
+    def __init__(self, d: int, capacity: int, clip: float = 5.0):
+        self.d = int(d)
         self.capacity = int(capacity)
-        self.device = device  # where reservoir + stats live (typically CPU)
-        self.stats = WelfordStats(d=d, device=device)
+        self.clip = float(clip)
+
+        self.scaler = StandardScaler(with_mean=True, with_std=True)
         self.n_seen = 0
-        self.data = torch.empty((self.capacity, d), device=device, dtype=torch.float32)
         self.size = 0
+        self.data = np.empty((self.capacity, self.d), dtype=np.float32)
 
-    @staticmethod
-    def rms_normalize_batch(Z: Tensor, eps: float = 1e-8) -> Tensor:
-        # Z: (B, D) float32
-        rms = torch.sqrt(Z.pow(2).mean(dim=1, keepdim=True) + eps)
-        return Z / rms
-
-    def add_batch(self, Z: Tensor):
-        # Z: (B, D) on any device
-        Z_cpu = Z.detach().to(device=self.device, dtype=torch.float32)
-        if Z_cpu.numel() == 0:
+    def add_batch(self, z_torch: Tensor):
+        if z_torch is None or z_torch.numel() == 0:
             return
+        z = z_torch.detach().to(device="cpu", dtype=torch.float32).numpy()
+        z = _rms_normalize_rows(z)  # (B,D)
+        self.scaler.partial_fit(z)
 
-        Zn = self.rms_normalize_batch(Z_cpu)  # (B, D)
-        self.stats.update_batch(Zn)
-
-        B = Zn.shape[0]
-
-        # Fill phase
+        b = z.shape[0]
+        # fill
         if self.size < self.capacity:
-            n_fill = min(self.capacity - self.size, B)
-            self.data[self.size:self.size + n_fill].copy_(Zn[:n_fill])
+            n_fill = min(self.capacity - self.size, b)
+            self.data[self.size:self.size + n_fill] = z[:n_fill]
             self.size += n_fill
             self.n_seen += n_fill
-            Z_remaining = Zn[n_fill:]
-        else:
-            Z_remaining = Zn
-
-        if Z_remaining.numel() == 0:
+            z = z[n_fill:]
+        if z.size == 0:
             return
 
-        # Replacement phase (vectorized reservoir sampling)
-        Br = Z_remaining.shape[0]
-        # For each incoming row t (0..Br-1), sample j_t ~ Unif{0..(n_seen+t)}
-        # Use torch RNG (preserved by preserve_rng_state).
-        offsets = torch.arange(1, Br + 1, device=self.device, dtype=torch.int64)
-        n_seen_t = self.n_seen + offsets  # (Br,)
-        u = torch.rand(Br, device=self.device)
-        j = torch.floor(u * n_seen_t.to(dtype=torch.float32)).to(dtype=torch.int64)  # (Br,)
+        # replacement (vectorized reservoir)
+        br = z.shape[0]
+        # indices sampled uniformly in [0, n_seen + t]
+        n_seen_t = self.n_seen + np.arange(1, br + 1, dtype=np.int64)
+        j = (np.random.rand(br) * n_seen_t.astype(np.float64)).astype(np.int64)
         mask = j < self.capacity
-        if mask.any():
-            self.data[j[mask]].copy_(Z_remaining[mask])
+        if np.any(mask):
+            self.data[j[mask]] = z[mask]
+        self.n_seen += br
 
-        self.n_seen += Br
+    def finalize_X(self) -> np.ndarray:
+        """Return standardized reservoir matrix X in float32."""
+        if self.size < 2:
+            return np.empty((0, self.d), dtype=np.float32)
+        mu = self.scaler.mean_.astype(np.float32, copy=False)
+        std = np.sqrt(self.scaler.var_.astype(np.float32, copy=False) + 1e-12)
+        X = (self.data[:self.size] - mu[None, :]) / (std[None, :] + 1e-8)
+        if self.clip is not None:
+            X = np.clip(X, -self.clip, self.clip)
+        return X.astype(np.float32, copy=False)
 
-    def finalize_matrix(self, clip: Optional[float] = 5.0, eps: float = 1e-8) -> Tensor:
-        """Return standardized reservoir matrix X in float32 on self.device."""
-        mu, std = self.stats.finalize()
-        X = (self.data[:self.size] - mu) / (std + eps)
-        if clip is not None:
-            X = X.clamp(min=-clip, max=clip)
-        return X
 
+# ---------------------------------------------------------------------------
+# 4) Low-rank Gram proxy + adaptive bottleneck allocation
+# ---------------------------------------------------------------------------
 
-@dataclass
-class LowRankFactors:
-    V: Tensor   # (D, k_eff)
-    S: Tensor   # (k_eff,)
-    p: Tensor   # (D,)
-    eta: float
+@dataclass(frozen=True)
+class LowRank:
+    V: np.ndarray      # (D,k_eff)
+    S: np.ndarray      # (k_eff,)
+    p: np.ndarray      # (D,) leverage-tempered importance
+    eta: float         # explained energy proxy
     k_eff: int
 
 
-def lowrank_leverage_distribution(
-    X: Tensor, d: int, k: int, device: torch.device, eps: float = 1e-8
-) -> LowRankFactors:
-    """Compute tempered leverage distribution p over D neurons from reservoir matrix X.
+def lowrank_from_X(X: np.ndarray, d: int, k: int) -> LowRank:
+    """Compute low-rank factors + a neuron importance distribution.
 
-    Robust to small N: uses q <= min(N, D) and k_eff <= q.
+    We use randomized SVD for robustness and speed on CPU.
+    From X (N,D), we compute top k singular values/vectors:
+      X ≈ U diag(S) V^T
+
+    Neuron "leverage" (importance) is:
+      lev_i = ||V[i,:]||^2
+
+    We temper lev toward uniform by how much energy the top-k captures:
+      eta = sum(S^2) / ||X||_F^2
+      alpha = 1 - eta
+      p = (1-alpha)*lev_norm + alpha*uniform
     """
-    if X.numel() == 0 or X.shape[0] < 2:
-        p = torch.full((d,), 1.0 / d, dtype=torch.float32, device=device)
-        V = torch.zeros((d, 0), dtype=torch.float32, device=device)
-        S = torch.zeros((0,), dtype=torch.float32, device=device)
-        return LowRankFactors(V=V, S=S, p=p, eta=0.0, k_eff=0)
+    if X.size == 0 or X.shape[0] < 2:
+        p = np.full((d,), 1.0 / d, dtype=np.float32)
+        return LowRank(V=np.zeros((d, 0), np.float32), S=np.zeros((0,), np.float32), p=p, eta=0.0, k_eff=0)
 
-    Xd = X.to(device=device, dtype=torch.float32)
+    Xc = X - X.mean(axis=0, keepdims=True)  # safe even if already standardized
+    N = Xc.shape[0]
+    k_eff = int(min(k, d, max(1, min(N - 1, k))))
 
-    # Center (safe even if X already standardized)
-    Xd = Xd - Xd.mean(dim=0, keepdim=True)
+    # randomized_svd returns Vt: (k_eff,D)
+    _, S, Vt = randomized_svd(Xc, n_components=k_eff, n_iter=2, random_state=None)
+    V = Vt.T.astype(np.float32, copy=False)
+    S = S.astype(np.float32, copy=False)
 
-    N = Xd.shape[0]
-    q = min(k + 8, d, N)       # must satisfy q <= min(N, D)
-    k_eff = min(k, q)
+    lev = np.sum(V * V, axis=1).astype(np.float64)
+    lev_sum = float(np.sum(lev))
+    if lev_sum <= 0:
+        lev = np.full((d,), 1.0 / d, dtype=np.float64)
+    else:
+        lev = lev / lev_sum
 
-    if q <= 0 or k_eff <= 0:
-        p = torch.full((d,), 1.0 / d, dtype=torch.float32, device=device)
-        V = torch.zeros((d, 0), dtype=torch.float32, device=device)
-        S = torch.zeros((0,), dtype=torch.float32, device=device)
-        return LowRankFactors(V=V, S=S, p=p, eta=0.0, k_eff=0)
-
-    # torch.pca_lowrank returns V: (D, q)
-    _, S, V = torch.pca_lowrank(Xd, q=q, center=False)
-    V = V[:, :k_eff].contiguous()
-    S = S[:k_eff].contiguous()
-
-    # leverage over neurons
-    lev = V.pow(2).sum(dim=1).clamp_min(0.0)
-    lev_sum = lev.sum()
-    lev = (lev / lev_sum) if lev_sum.item() > 0 else torch.full_like(lev, 1.0 / d)
-
-    fro2 = float(Xd.pow(2).sum().item())
-    top2 = float(S.pow(2).sum().item())
-    eta = float(top2 / (fro2 + eps))
-    alpha = float(max(0.0, min(1.0, 1.0 - eta)))
+    fro2 = float(np.sum(Xc * Xc))
+    top2 = float(np.sum(S * S))
+    eta = float(top2 / (fro2 + 1e-8))
+    alpha = float(np.clip(1.0 - eta, 0.0, 1.0))
 
     p = (1.0 - alpha) * lev + alpha * (1.0 / d)
-    p = (p + 1e-12) / p.sum()
+    p = np.maximum(p, 1e-12)
+    p = (p / np.sum(p)).astype(np.float32, copy=False)
 
-    return LowRankFactors(V=V, S=S, p=p.detach(), eta=eta, k_eff=k_eff)
-
-
-def _sample_without_replacement(p: Tensor, m: int, device: torch.device) -> Tensor:
-    p = p.to(device=device, dtype=torch.float32)
-    p = (p + 1e-12) / p.sum()
-    m = min(int(m), p.numel())
-    return torch.multinomial(p, m, replacement=False)
+    return LowRank(V=V, S=S, p=p, eta=eta, k_eff=k_eff)
 
 
-def _build_candidate_gram(V: Tensor, S: Tensor, candidates: Tensor) -> Tensor:
-    A = V[candidates] * S.unsqueeze(0)  # (M, k_eff)
-    # R_ij = <A_i, A_j>
-    return torch.einsum("ik,jk->ij", A, A)
+def n_triangle(J: int) -> int:
+    """Dense-implied neuron count: smallest n with n(n+1)/2 >= J."""
+    J = int(max(0, J))
+    return int(math.ceil((math.sqrt(1.0 + 8.0 * J) - 1.0) / 2.0))
 
 
-def sample_pairs_from_factors(
-    factors: LowRankFactors,
+def sample_without_replacement(p: np.ndarray, m: int) -> np.ndarray:
+    p = np.asarray(p, dtype=np.float64)
+    p = np.maximum(p, 1e-12)
+    p = p / np.sum(p)
+    m = int(min(m, p.shape[0]))
+    return np.random.choice(p.shape[0], size=m, replace=False, p=p).astype(np.int64)
+
+
+def gram_abs_from_factors(V: np.ndarray, S: np.ndarray, idx: np.ndarray) -> np.ndarray:
+    """Compute |K| on a candidate set from low-rank factors.
+
+    If K ≈ V diag(S^2) V^T, then on candidates C:
+      K_C = (V_C diag(S)) (V_C diag(S))^T
+    """
+    A = (V[idx, :] * S[None, :]).astype(np.float32, copy=False)  # (M,k)
+    G = np.abs(A @ A.T).astype(np.float32, copy=False)          # (M,M)
+    np.fill_diagonal(G, 0.0)
+    return G
+
+
+def participation_ratio(q: np.ndarray) -> float:
+    """Effective support size: 1 / sum(q^2)."""
+    q = np.asarray(q, dtype=np.float64)
+    q = np.maximum(q, 1e-12)
+    q = q / np.sum(q)
+    return float(1.0 / np.sum(q * q))
+
+
+# ---------------------------------------------------------------------------
+# 5) Deterministic greedy edge selection with degree caps
+# ---------------------------------------------------------------------------
+
+def greedy_degree_capped_edges(
+    W: np.ndarray,
+    J: int,
+    d_max: int,
+    forbid_self: bool = True,
+) -> List[Tuple[int, int]]:
+    """Pick up to J edges from W (square, nonnegative) via greedy score order under degree cap.
+
+    This is the minimal “workhorse” primitive:
+      - score is W_ij
+      - accept highest score edges while degrees <= d_max
+      - deterministic given W and tie ordering from argsort
+
+    Complexity is fine for M<=1024 once at init time.
+    """
+    M = W.shape[0]
+    if M <= 1 or J <= 0:
+        return []
+
+    tri_i, tri_j = np.triu_indices(M, k=1 if forbid_self else 0)
+    scores = W[tri_i, tri_j]
+
+    order = np.argsort(scores)[::-1]
+    deg = np.zeros((M,), dtype=np.int32)
+    out: List[Tuple[int, int]] = []
+
+    for k in order:
+        if len(out) >= J:
+            break
+        i = int(tri_i[k])
+        j = int(tri_j[k])
+        if forbid_self and i == j:
+            continue
+        if deg[i] >= d_max or deg[j] >= d_max:
+            continue
+        if scores[k] <= 0:
+            break
+        out.append((i, j))
+        deg[i] += 1
+        deg[j] += 1
+
+    return out
+
+
+def pairs_from_lowrank_adaptive(
+    factors: LowRank,
     J: int,
     n_self: int,
     d: int,
-    device: torch.device,
-    L: int = 64,
-    max_attempts: int = 64,
-    global_attempts_mult: int = 10,
-    return_info: bool = False,
-) -> Tuple[Tensor, Tensor] | Tuple[Tensor, Tensor, Dict[str, Any]]:
-    """Sample J pairs (left,right) using degree-capped, correlation-guided sampling with termination guarantees."""
+    M: int,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    """Adaptive universal pairing policy from low-rank kernel proxy.
+
+    Mental model:
+      - Build a small candidate Gram proxy |K_C| of size MxM
+      - Measure hubness distribution q over candidates from row-sums of |K_C|
+      - Infer whether the kernel is bottleneck-friendly via n_eff(q)
+      - Allocate edges: J_core (bottlenecked within top hubs) + J_wide (coverage)
+      - Select edges deterministically by greedy degree-capped scores
+
+    This yields a universal default:
+      - If kernel has strong hubs: behaves dense-like (helps tasks like mazes)
+      - If kernel diffuse: behaves coverage-like (helps perceptual tasks)
+      - No task flags; no tuning knobs.
+    """
     J = int(J)
+    d = int(d)
     n_self = int(min(n_self, max(0, J - 1)))
-    p = factors.p.to(device=device)
-    V = factors.V.to(device=device)
-    S = factors.S.to(device=device)
 
-    k_eff = factors.k_eff
-    if k_eff <= 0:
-        # Pure uniform fallback (still respect self-pair prefix)
-        left = torch.randint(0, d, (J,), device=device)
-        right = torch.randint(0, d, (J,), device=device)
+    # fallback for missing factors
+    if factors.k_eff <= 0:
+        left = np.random.randint(0, d, size=J, dtype=np.int64)
+        right = np.random.randint(0, d, size=J, dtype=np.int64)
+        # enforce exact self-prefix if requested
         if n_self > 0:
-            top_self = torch.topk(factors.p.to(device=device), k=n_self, largest=True).indices
-            left[:n_self] = top_self
-            right[:n_self] = top_self
-        return left.long(), right.long()
+            top = np.argsort(factors.p)[::-1][:n_self]
+            left[:n_self] = top
+            right[:n_self] = top
+        return left, right, {"mode": "uniform_fallback"}
 
-    M = min(d, 4 * k_eff)
-    candidates = _sample_without_replacement(p, M, device=device)  # (M,)
-    pC = p[candidates]
-    pC = (pC + 1e-12) / pC.sum()
-    sqrt_pC = torch.sqrt(pC)
+    # choose candidate set C
+    C = sample_without_replacement(factors.p, M)  # indices in [0..D)
+    G = gram_abs_from_factors(factors.V[:, :factors.k_eff], factors.S[:factors.k_eff], C)  # (M,M)
 
-    R = _build_candidate_gram(V, S, candidates)  # (M, M)
-    absR = R.abs()
-    absR.fill_diagonal_(0.0)
+    # hubness q over candidates
+    s = np.sum(G, axis=1).astype(np.float64)
+    s = np.maximum(s, 1e-12)
+    q = (s / np.sum(s)).astype(np.float32, copy=False)
+    n_eff = participation_ratio(q)
 
-    L_eff = min(int(L), M - 1) if M > 1 else 0
-    # Precompute neighbor indices for each candidate row
-    neigh_idx = []
-    neigh_w = []
-    if L_eff > 0:
-        topk_vals, topk_idx = torch.topk(absR, k=L_eff, dim=1, largest=True, sorted=False)
-        neigh_idx = topk_idx  # (M, L)
-        # weights will be computed per i using p_j
-        neigh_w = topk_vals  # (M, L)
+    n_tri = n_triangle(J)
+    f = float(min(1.0, n_tri / max(1e-6, n_eff)))  # bottleneck fraction inferred from kernel
 
+    # allocate non-self edges between core and wide
+    J_nonself = J - n_self
+    J_core = int(round(f * J_nonself))
+    J_wide = J_nonself - J_core
+
+    # build scores on candidates: W_ij = |K_ij| * sqrt(q_i q_j)
+    sqrt_q = np.sqrt(q.astype(np.float64) + 1e-12)
+    W = (G * (sqrt_q[:, None] * sqrt_q[None, :]).astype(np.float32)).astype(np.float32, copy=False)
+    np.fill_diagonal(W, 0.0)
+
+    # self-pairs: choose top candidates by q, mapped back to global indices
     left_pairs: List[int] = []
     right_pairs: List[int] = []
     used = set()
-    deg = torch.zeros(M, device=device, dtype=torch.int32)
 
-    # Add self-pairs first: pick top p globally, deterministic
     if n_self > 0:
-        top_self = torch.topk(p, k=n_self, largest=True).indices
-        for idx in top_self.tolist():
+        top_local = np.argsort(q)[::-1][:n_self]
+        top_global = C[top_local]
+        for idx in top_global.tolist():
             left_pairs.append(int(idx))
             right_pairs.append(int(idx))
             used.add((int(idx), int(idx)))
 
-    # Degree cap over candidates (for non-self pairs)
-    n_tri = int(math.ceil((math.sqrt(1.0 + 8.0 * J) - 1.0) / 2.0))
-    n_target = n_tri if J <= M else M
-    d_max = int(math.ceil(2 * J / max(1, n_target)))
-    d_max_start = d_max
-    d_max_increments = 0
-    used_ultimate_fallback = False
+    # core edges: restrict to top hubs B
+    Bn = int(min(M, max(1, n_tri)))
+    B = np.argsort(q)[::-1][:Bn]  # local indices in [0..M)
 
-    total_attempts = 0
-    target_nonself = J - n_self
-
-    def _unsat_candidates_mask():
-        return (deg < d_max)
-
-    def _choose_uniform_unsat(exclude_i: Optional[int] = None) -> Optional[int]:
-        mask = _unsat_candidates_mask()
-        if exclude_i is not None:
-            mask[exclude_i] = False
-        idxs = torch.nonzero(mask, as_tuple=False).flatten()
-        if idxs.numel() == 0:
-            return None
-        j = idxs[torch.randint(0, idxs.numel(), (1,), device=device)].item()
-        return int(j)
-
-    # Helper to record an edge
-    def _accept(i_c: int, j_c: int) -> bool:
-        # i_c, j_c are candidate indices [0..M-1]
-        if i_c == j_c:
-            return False
-        if deg[i_c] >= d_max or deg[j_c] >= d_max:
-            return False
-        i_g = int(candidates[i_c].item())
-        j_g = int(candidates[j_c].item())
-        key = (i_g, j_g)
-        if key in used:
-            return False
-        used.add(key)
-        left_pairs.append(i_g)
-        right_pairs.append(j_g)
-        deg[i_c] += 1
-        deg[j_c] += 1
-        return True
-
-    # Main loop
-    while len(left_pairs) - n_self < target_nonself:
-        if total_attempts > global_attempts_mult * max(1, target_nonself):
-            # Ultimate fallback: fill remaining with uniform random pairs over [0, d)
-            # Fill until we have target_total pairs; guaranteed termination.
-            while len(left_pairs) < (n_self + target_nonself):
-                i_g = int(torch.randint(0, d, (1,), device=device).item())
-                j_g = int(torch.randint(0, d, (1,), device=device).item())
-                # Avoid creating additional self-pairs beyond the explicit n_self prefix.
-                if d > 1 and j_g == i_g:
-                    j_g = (i_g + 1) % d
-                if (i_g, j_g) in used:
-                    continue
-                used.add((i_g, j_g))
-                left_pairs.append(i_g)
-                right_pairs.append(j_g)
-            used_ultimate_fallback = True
-            break
-
-        # sample left endpoint among candidates
-        i_c = int(torch.multinomial(pC, 1, replacement=True).item())
-        attempts = 0
-        accepted = False
-        while attempts < max_attempts and not accepted:
-            total_attempts += 1
-            attempts += 1
-
-            if deg[i_c] >= d_max:
-                # choose a new i
-                i_c = int(torch.multinomial(pC, 1, replacement=True).item())
+    # select edges within B
+    if J_core > 0 and Bn > 1:
+        WB = W[np.ix_(B, B)]
+        dmax_core = int(math.ceil(2 * J_core / max(1, Bn)))
+        edges_core = greedy_degree_capped_edges(WB, J_core, dmax_core, forbid_self=True)
+        for (iB, jB) in edges_core:
+            i = int(C[B[iB]])
+            j = int(C[B[jB]])
+            if (i, j) in used or i == j:
                 continue
+            used.add((i, j))
+            left_pairs.append(i)
+            right_pairs.append(j)
 
-            if L_eff > 0:
-                neighs = neigh_idx[i_c]  # (L,)
-                # compute weights w_ij = sqrt(p_i p_j) * |R_ij|
-                # p_i via sqrt_pC[i_c], p_j via sqrt_pC[neigh]
-                w = sqrt_pC[i_c] * sqrt_pC[neighs] * neigh_w[i_c]
-                w_sum = w.sum()
-                if w_sum.item() <= 0:
-                    # fallback to uniform among neighbors
-                    j_c = int(neighs[torch.randint(0, neighs.numel(), (1,), device=device)].item())
-                else:
-                    w = (w + 1e-12) / w_sum
-                    j_c = int(neighs[torch.multinomial(w, 1, replacement=True)].item())
-            else:
-                # no neighbors; fall back immediately
-                j_c = _choose_uniform_unsat(exclude_i=i_c)
-                if j_c is None:
-                    accepted = False
-                    break
+    # wide edges: full candidates with diffuse cap
+    if J_wide > 0 and M > 1:
+        dmax_wide = int(math.ceil(2 * J_wide / max(1, M)))
+        edges_wide = greedy_degree_capped_edges(W, J_wide, dmax_wide, forbid_self=True)
+        for (iC, jC) in edges_wide:
+            i = int(C[iC])
+            j = int(C[jC])
+            if (i, j) in used or i == j:
+                continue
+            used.add((i, j))
+            left_pairs.append(i)
+            right_pairs.append(j)
 
-            # Try accept
-            accepted = _accept(i_c, j_c)
-
-        if accepted:
+    # If we didn't reach J, fill remaining uniformly (guaranteed termination, no extra self pairs)
+    while len(left_pairs) < J:
+        i = int(np.random.randint(0, d))
+        j = int(np.random.randint(0, d))
+        if i == j:
             continue
-
-        # Staged fallback if couldn't accept within max_attempts:
-        # 1) keep degree cap; choose uniform unsaturated j
-        j_c = _choose_uniform_unsat(exclude_i=i_c)
-        if j_c is not None and _accept(i_c, j_c):
+        if (i, j) in used:
             continue
+        used.add((i, j))
+        left_pairs.append(i)
+        right_pairs.append(j)
 
-        # 2) relax degree cap minimally
-        d_max += 1
-        d_max_increments += 1
-        # try once more with relaxed cap
-        j_c = _choose_uniform_unsat(exclude_i=i_c)
-        if j_c is not None and _accept(i_c, j_c):
-            continue
+    left = np.asarray(left_pairs[:J], dtype=np.int64)
+    right = np.asarray(right_pairs[:J], dtype=np.int64)
 
-    left = torch.tensor(left_pairs[:J], device=device, dtype=torch.long)
-    right = torch.tensor(right_pairs[:J], device=device, dtype=torch.long)
+    diag = {
+        "mode": "adaptive",
+        "M": int(M),
+        "n_tri": int(n_tri),
+        "n_eff": float(n_eff),
+        "f_bottleneck": float(f),
+        "J_core": int(J_core),
+        "J_wide": int(J_wide),
+        "Bn": int(Bn),
+        "self": int(n_self),
+    }
+    return left, right, diag
 
-    if return_info:
-        info = {
-            "d_max_start": d_max_start,
-            "d_max_final": d_max,
-            "d_max_increments": d_max_increments,
-            "used_ultimate_fallback": used_ultimate_fallback,
-        }
-        return left, right, info
 
-    return left, right
-
+# ---------------------------------------------------------------------------
+# 6) Task-agnostic initialization entrypoint
+# ---------------------------------------------------------------------------
 
 def default_warmup_batches(args_warmup_steps: int) -> int:
-    """Occam + safe default: cap warmup batches to avoid surprising slowdowns."""
+    """Occam default: warmup is about statistics, not LR scheduling."""
     if args_warmup_steps and args_warmup_steps > 0:
         return int(min(1024, args_warmup_steps))
     return 1024
@@ -570,30 +513,34 @@ def _default_batch_to_x(batch: Any) -> Tensor:
         return batch
     if isinstance(batch, (tuple, list)):
         return batch[0]
-    if isinstance(batch, dict):
-        raise ValueError("Batch is a dict; please provide batch_to_x.")
-    raise TypeError(f"Unsupported batch type: {type(batch)}")
+    raise TypeError(f"Unsupported batch type: {type(batch)}. Provide batch_to_x.")
 
 
 def initialize_ctm_pairs(
     model: nn.Module,
     dataloader: Iterable,
+    *,
     warmup_batches: int,
     n_random_pairing_self: int,
-    device: str | torch.device | None = None,
+    device: Optional[torch.device | str] = None,
     batch_to_x: Optional[Callable[[Any], Tensor]] = None,
-    seed_preserve: bool = True,
-) -> None:
-    """One-shot initialization of CTM action/out random-pairing indices using warmup batches.
+    preserve_seed: bool = True,
+) -> Dict[str, Any]:
+    """One-shot pairing initialization for CTM (action/out), task-agnostic.
 
-    Requirements:
-    - `model` must expose:
-        - `.d_model`, `.n_synch_action`, `.n_synch_out`
-        - `.resample_action_pairs_(n_random_pairing_self)`
-        - `.set_neuron_pairs(synch_type, left, right)`
-        - `.forward(..., callback=...)`
+    Expected model interface:
+      - attributes: d_model, n_synch_action, n_synch_out
+      - methods:
+          resample_action_pairs_(n_random_pairing_self: int)  [optional but recommended]
+          set_neuron_pairs(role: str, left: Tensor, right: Tensor)
+      - forward signature: model(x, track=False, callback=collector)
 
-    This function is task-agnostic: it only needs a dataloader and a way to extract x.
+    High-level algorithm:
+      1) Warmup: gather Z_star (and Z_last) states from real data forwards
+      2) Build standardized reservoir matrices X_action, X_out
+      3) Estimate low-rank Gram proxy factors for each role
+      4) Sample pairs using adaptive bottleneck allocation from kernel hubness
+      5) Write indices into model buffers once
     """
     if batch_to_x is None:
         batch_to_x = _default_batch_to_x
@@ -608,24 +555,22 @@ def initialize_ctm_pairs(
     d = int(getattr(model, "d_model"))
     J_action = int(getattr(model, "n_synch_action"))
     J_out = int(getattr(model, "n_synch_out"))
-    k = min(256, d)
-    n_res = min(32768, 32 * k)  # memory bound
 
-    # Reservoirs on CPU for stability/memory
-    cpu = torch.device("cpu")
-    res_action = Reservoir(d=d, capacity=n_res, device=cpu)
-    res_out = Reservoir(d=d, capacity=n_res, device=cpu)
+    # design constants
+    k = int(min(256, d))
+    n_res = int(min(32768, 32 * k))  # bounded memory
+    M = int(min(d, 4 * k))           # bounded quadratic object
+
+    # reservoirs (role-specific)
+    res_action = Reservoir(d=d, capacity=n_res, clip=5.0)
+    res_out = Reservoir(d=d, capacity=n_res, clip=5.0)
 
     collector = TickRepresentativeCollector()
-
-    # Warmup pass
     tstars: List[int] = []
-    last_ticks: List[int] = []
-    best_deltas: List[float] = []
-    gap_fracs: List[float] = []
-    with preserve_rng_state(seed_preserve), batchnorm_use_batch_stats_no_update(model), torch.inference_mode():
+
+    with preserve_rng_state(preserve_seed), batchnorm_use_batch_stats_no_update(model), torch.inference_mode():
         it = iter(dataloader)
-        for _ in tqdm(range(int(warmup_batches)), desc="Synchronization Init Warmup"):
+        for _ in range(int(warmup_batches)):
             try:
                 batch = next(it)
             except StopIteration:
@@ -634,223 +579,61 @@ def initialize_ctm_pairs(
 
             x = batch_to_x(batch).to(device, non_blocking=True)
 
-            # Break circularity: resample action pairs only
+            # Break circularity: resample action pairs only (action affects trajectories)
             if hasattr(model, "resample_action_pairs_"):
-                model.resample_action_pairs_(n_random_pairing_self=int(n_random_pairing_self))
+                model.resample_action_pairs_(int(n_random_pairing_self))
 
             collector.reset()
-            _ = model(x, track=False, callback=collector)  # forward only
-
+            _ = model(x, track=False, callback=collector)
             snaps = collector.snapshots()
-            t_star = collector.t_star()
-            if t_star is not None:
-                tstars.append(int(t_star))
-            if collector.last_tick is not None:
-                last_ticks.append(int(collector.last_tick))
-            if collector.best_delta >= 0:
-                best_deltas.append(float(collector.best_delta))
-                # gap fraction: (best - second_best)/best (0 means plateau)
-                if collector.second_best_delta >= 0 and collector.best_delta > 1e-12:
-                    gap_fracs.append(float((collector.best_delta - collector.second_best_delta) / collector.best_delta))
-                else:
-                    gap_fracs.append(1.0)  # only one delta available => “sharp”
+            if snaps.t_star is not None:
+                tstars.append(int(snaps.t_star))
             if snaps.z_star is None or snaps.z_last is None:
                 continue
 
-            # Action statistics: Z_star only
+            # action: Z_star only
             res_action.add_batch(snaps.z_star)
-            # Out statistics: Z_star and Z_last
+            # out: Z_star + Z_last
             res_out.add_batch(snaps.z_star)
             res_out.add_batch(snaps.z_last)
 
-    # Finalize and compute factors/pairs (move compute to target device)
-    X_action = res_action.finalize_matrix(clip=5.0)
-    X_out = res_out.finalize_matrix(clip=5.0)
+    X_action = res_action.finalize_X()
+    X_out = res_out.finalize_X()
 
-    factors_action = lowrank_leverage_distribution(X_action, d=d, k=k, device=device)
-    factors_out = lowrank_leverage_distribution(X_out, d=d, k=k, device=device)
+    factors_action = lowrank_from_X(X_action, d=d, k=k)
+    factors_out = lowrank_from_X(X_out, d=d, k=k)
 
-    # L depends on M which depends on k_eff
-    L_a = min(64, max(0, min(d, 4 * factors_action.k_eff) - 1))
-    L_o = min(64, max(0, min(d, 4 * factors_out.k_eff) - 1))
-
-    left_a, right_a, info_a = sample_pairs_from_factors(
-        factors=factors_action,
-        J=J_action,
-        n_self=n_random_pairing_self,
-        d=d,
-        device=device,
-        L=L_a,
-        return_info=True,
+    left_a, right_a, diag_a = pairs_from_lowrank_adaptive(
+        factors_action, J=J_action, n_self=n_random_pairing_self, d=d, M=M
     )
-    left_o, right_o, info_o = sample_pairs_from_factors(
-        factors=factors_out,
-        J=J_out,
-        n_self=n_random_pairing_self,
-        d=d,
-        device=device,
-        L=L_o,
-        return_info=True,
+    left_o, right_o, diag_o = pairs_from_lowrank_adaptive(
+        factors_out, J=J_out, n_self=n_random_pairing_self, d=d, M=M
     )
 
-    # Write into model buffers once
-    model.set_neuron_pairs("action", left_a, right_a)
-    model.set_neuron_pairs("out", left_o, right_o)
+    model.set_neuron_pairs("action", torch.from_numpy(left_a).to(device=device), torch.from_numpy(right_a).to(device=device))
+    model.set_neuron_pairs("out", torch.from_numpy(left_o).to(device=device), torch.from_numpy(right_o).to(device=device))
 
-    t_arr = np.array(tstars, dtype=np.int32) if tstars else np.array([0], dtype=np.int32)
-    last_arr = np.array(last_ticks, dtype=np.int32) if last_ticks else np.array([0], dtype=np.int32)
-    t_mean = float(t_arr.mean())
-    t_std = float(t_arr.std())
-    # boundary extreme: t_star == 0 or t_star == (T-1), per batch
-    boundary_extreme = float(((t_arr == 0) | (t_arr == last_arr)).mean()) if tstars else 0.0
-    best_delta_mean = float(np.mean(best_deltas)) if best_deltas else float("nan")
-    gap_frac_mean = float(np.mean(gap_fracs)) if gap_fracs else float("nan")
-    gap_frac_p10 = float(np.percentile(gap_fracs, 10)) if gap_fracs else float("nan")
-    print(f"[warmup] best_delta_mean={best_delta_mean:.4f} gap_frac_mean={gap_frac_mean:.4f} gap_frac_p10={gap_frac_p10:.4f} boundary_extreme={boundary_extreme:.3f}")
-
-
-    warm_diag = WarmupDiagnostics(
-        warmup_batches=int(warmup_batches),
-        reservoir_capacity=int(n_res),
-        reservoir_size_action=int(res_action.size),
-        reservoir_size_out=int(res_out.size),
-        reservoir_seen_action=int(res_action.n_seen),
-        reservoir_seen_out=int(res_out.n_seen),
-        t_star_mean=t_mean,
-        t_star_std=t_std,
-    )
-
-    role_diag_a = _pair_role_diagnostics(
-        role="action",
-        left=left_a, right=right_a,
-        J=J_action, n_self=n_random_pairing_self, d=d,
-        factors=factors_action, sampler_info=info_a,
-    )
-    role_diag_o = _pair_role_diagnostics(
-        role="out",
-        left=left_o, right=right_o,
-        J=J_out, n_self=n_random_pairing_self, d=d,
-        factors=factors_out, sampler_info=info_o,
-    )
-
-    log_pair_init_diagnostics(warm_diag, [role_diag_a, role_diag_o], log_fn=print)
-
-
-def _entropy_normalized(p: Tensor, eps: float = 1e-12) -> float:
-    p = p.detach().float()
-    p = (p + eps) / (p.sum() + eps)
-    H = -(p * (p + eps).log()).sum().item()
-    return float(H / math.log(p.numel() + 1e-12))
-
-
-def _pair_role_diagnostics(
-    role: str,
-    left: Tensor,
-    right: Tensor,
-    J: int,
-    n_self: int,
-    d: int,
-    factors: LowRankFactors,
-    sampler_info: Dict[str, Any],
-) -> PairRoleDiagnostics:
-    left = left.detach().cpu()
-    right = right.detach().cpu()
-
-    pairs = torch.stack([left, right], dim=1)  # (J,2)
-    unique_pairs = torch.unique(pairs, dim=0).shape[0]
-    unique_pair_frac = float(unique_pairs / max(1, J))
-
-    self_ct = int((left == right).sum().item())
-    self_pair_frac = float(self_ct / max(1, J))
-
-    touched = torch.unique(torch.cat([left, right], dim=0))
-    unique_neurons = int(touched.numel())
-
-    deg = torch.bincount(torch.cat([left, right]), minlength=d)  # degree counts
-    deg_nonzero = deg[deg > 0]
-    if deg_nonzero.numel() == 0:
-        deg_min, deg_med, deg_max = 0, 0.0, 0
-    else:
-        deg_min = int(deg_nonzero.min().item())
-        deg_max = int(deg_nonzero.max().item())
-        deg_med = float(deg_nonzero.median().item())
-
-    eta = float(factors.eta)
-    alpha = float(max(0.0, min(1.0, 1.0 - eta)))
-    p_ent = _entropy_normalized(factors.p.cpu())
-
-    return PairRoleDiagnostics(
-        role=role,
-        J=int(J),
-        n_self=int(min(n_self, J)),
-        unique_pair_frac=unique_pair_frac,
-        self_pair_frac=self_pair_frac,
-        unique_neurons=unique_neurons,
-        deg_min=deg_min,
-        deg_median=deg_med,
-        deg_max=deg_max,
-        eta=eta,
-        alpha=alpha,
-        k_eff=int(factors.k_eff),
-        p_entropy_norm=p_ent,
-        d_max_final=int(sampler_info.get("d_max_final", -1)),
-        d_max_increments=int(sampler_info.get("d_max_increments", 0)),
-        used_ultimate_fallback=bool(sampler_info.get("used_ultimate_fallback", False)),
-    )
-
-
-def log_pair_init_diagnostics(warm: WarmupDiagnostics, roles: List[PairRoleDiagnostics], log_fn: Callable[[str], None] = print) -> None:
-    log_fn("=== CTM Pair Initialization Diagnostics ===")
-    log_fn(f"Warmup: batches={warm.warmup_batches}  reservoir_cap={warm.reservoir_capacity}")
-    log_fn(f"Reservoir action: size={warm.reservoir_size_action} seen={warm.reservoir_seen_action}")
-    log_fn(f"Reservoir out:    size={warm.reservoir_size_out} seen={warm.reservoir_seen_out}")
-    log_fn(f"t_star: mean={warm.t_star_mean:.2f} std={warm.t_star_std:.2f}")
-    for r in roles:
-        log_fn(f"[{r.role}] J={r.J} n_self={r.n_self} unique_pairs={r.unique_pair_frac:.3f} self_frac={r.self_pair_frac:.3f}")
-        log_fn(f"[{r.role}] unique_neurons={r.unique_neurons} deg(min/med/max)={r.deg_min}/{r.deg_median:.1f}/{r.deg_max}")
-        log_fn(f"[{r.role}] k_eff={r.k_eff} eta={r.eta:.3f} alpha={r.alpha:.3f} H(p)/logD={r.p_entropy_norm:.3f}")
-        log_fn(f"[{r.role}] d_max_final={r.d_max_final} increments={r.d_max_increments} ultimate_fallback={r.used_ultimate_fallback}")
-
-
-class SyncStatsCollector:
-    """Collect per-batch sync health stats without storing full traces."""
-    def __init__(self, near_zero_tol: float = 1e-3):
-        self.near_zero_tol = near_zero_tol
-        self._stds: Dict[str, float] = {}
-        self._near_zero_frac: Dict[str, float] = {}
-        self._last_tick: int = -1
-
-    def __call__(self, tick_idx: int, role: str, sync_vec: Tensor):
-        # sync_vec: (B, J)
-        self._last_tick = tick_idx
-        # Only keep last observed tick per role (cheap, and matches "health at current compute step")
-        std = sync_vec.detach().float().std(dim=0)  # (J,)
-        self._stds[role] = float(std.mean().item())
-        self._near_zero_frac[role] = float((std < self.near_zero_tol).float().mean().item())
-
-    def summary(self) -> Dict[str, Any]:
-        return {
-            "last_tick": self._last_tick,
-            "action_sync_std_mean": self._stds.get("action", float("nan")),
-            "out_sync_std_mean": self._stds.get("out", float("nan")),
-            "action_sync_near_zero_frac": self._near_zero_frac.get("action", float("nan")),
-            "out_sync_near_zero_frac": self._near_zero_frac.get("out", float("nan")),
-        }
-
-
-def summarize_max_certainty_tick(certainties: Any) -> Dict[str, float]:
-    """Return mean/std of argmax certainty tick across batch."""
-    if isinstance(certainties, list):
-        cert = torch.stack([c.detach() for c in certainties], dim=1)  # (B,T)
-    else:
-        cert = certainties.detach()
-        if cert.dim() == 2:
-            pass
-        elif cert.dim() == 3:
-            # If model returns (T,B,...) style, try to coerce; keep conservative:
-            cert = cert.squeeze(-1)
-        else:
-            return {"t2_mean": float("nan"), "t2_std": float("nan")}
-
-    t2 = cert.argmax(dim=1).float()  # (B,)
-    return {"t2_mean": float(t2.mean().item()), "t2_std": float(t2.std(unbiased=False).item())}
+    t_arr = np.asarray(tstars, dtype=np.float32) if tstars else np.asarray([0.0], dtype=np.float32)
+    diag = {
+        "warmup_batches": int(warmup_batches),
+        "reservoir_capacity": int(n_res),
+        "reservoir_size_action": int(res_action.size),
+        "reservoir_seen_action": int(res_action.n_seen),
+        "reservoir_size_out": int(res_out.size),
+        "reservoir_seen_out": int(res_out.n_seen),
+        "t_star_mean": float(np.mean(t_arr)),
+        "t_star_std": float(np.std(t_arr)),
+        "action": {
+            "J": int(J_action),
+            "k_eff": int(factors_action.k_eff),
+            "eta": float(factors_action.eta),
+            **diag_a,
+        },
+        "out": {
+            "J": int(J_out),
+            "k_eff": int(factors_out.k_eff),
+            "eta": float(factors_out.eta),
+            **diag_o,
+        },
+    }
+    return diag
