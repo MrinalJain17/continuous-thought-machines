@@ -43,3 +43,27 @@ python -m tasks.mazes.train \
     --device 0 \
     --use_amp
 ```
+
+```
+python -m tasks.mazes.train \
+    --dataset mazes-medium \
+    --log_dir logs/medium_maze \
+    --model ctm \
+    --d_model 2048 \
+    --dropout 0.1 \
+    --backbone_type resnet34-2 \
+    --d_input 512 \
+    --heads 16 \
+    --iterations 75 \
+    --synapse_depth 8 \
+    --n_synch_out 528 \
+    --n_synch_action 528 \
+    --neuron_select_type random-pairing \
+    --n_random_pairing_self 32 \
+    --memory_length 25 \
+    --memory_hidden_dims 32 \
+    --batch_size 64 \
+    --training_iterations 100000 \
+    --device 0 \
+    --use_amp
+```

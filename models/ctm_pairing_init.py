@@ -380,7 +380,7 @@ def sample_pairs_from_factors(
 ) -> Tuple[Tensor, Tensor] | Tuple[Tensor, Tensor, Dict[str, Any]]:
     """Sample J pairs (left,right) using degree-capped, correlation-guided sampling with termination guarantees."""
     J = int(J)
-    n_self = int(min(n_self, J))
+    n_self = int(min(n_self, max(0, J - 1)))
     p = factors.p.to(device=device)
     V = factors.V.to(device=device)
     S = factors.S.to(device=device)
@@ -430,7 +430,9 @@ def sample_pairs_from_factors(
             used.add((int(idx), int(idx)))
 
     # Degree cap over candidates (for non-self pairs)
-    d_max = int(math.ceil(2 * max(1, J) / max(1, M)))
+    n_tri = int(math.ceil((math.sqrt(1.0 + 8.0 * J) - 1.0) / 2.0))
+    n_target = n_tri if J <= M else M
+    d_max = int(math.ceil(2 * J / max(1, n_target)))
     d_max_start = d_max
     d_max_increments = 0
     used_ultimate_fallback = False
