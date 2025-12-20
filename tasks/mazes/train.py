@@ -491,7 +491,7 @@ if __name__=='__main__':
                     )
 
                 snaps = tick_health.snapshots()
-                t_star = tick_health.t_star()
+                t_star = snaps.t_star
                 t_star_i = int(t_star) if t_star is not None else None
 
                 s_action_star = sync_health.get("action", t_star_i)
