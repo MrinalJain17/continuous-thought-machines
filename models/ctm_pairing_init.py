@@ -284,9 +284,12 @@ def lowrank_from_X(X: np.ndarray, d: int, k: int) -> LowRank:
 
 
 def n_triangle(J: int) -> int:
-    """Dense-implied neuron count: smallest n with n(n+1)/2 >= J."""
+    """Smallest n such that n(n-1)/2 >= J (i.e., J distinct non-self edges)."""
     J = int(max(0, J))
-    return int(math.ceil((math.sqrt(1.0 + 8.0 * J) - 1.0) / 2.0))
+    if J == 0:
+        return 0
+    # Solve n(n-1)/2 >= J  =>  n^2 - n - 2J >= 0
+    return int(math.ceil((1.0 + math.sqrt(1.0 + 8.0 * J)) / 2.0))
 
 
 def sample_without_replacement(p: np.ndarray, m: int) -> np.ndarray:
@@ -411,11 +414,11 @@ def pairs_from_lowrank_adaptive(
     q = (s / np.sum(s)).astype(np.float32, copy=False)
     n_eff = participation_ratio(q)
 
-    n_tri = n_triangle(J)
+    # Non-self edges are what the graph sampler actually selects (self edges are forced prefix).
+    J_nonself = J - n_self
+    n_tri = n_triangle(J_nonself)  # node-count implied by the non-self edge budget
     f = float(min(1.0, n_tri / max(1e-6, n_eff)))  # bottleneck fraction inferred from kernel
 
-    # allocate non-self edges between core and wide
-    J_nonself = J - n_self
     J_core = int(round(f * J_nonself))
     J_wide = J_nonself - J_core
 
@@ -437,14 +440,28 @@ def pairs_from_lowrank_adaptive(
             right_pairs.append(int(idx))
             used.add((int(idx), int(idx)))
 
-    # core edges: restrict to top hubs B
-    Bn = int(min(M, max(1, n_tri)))
-    B = np.argsort(q)[::-1][:Bn]  # local indices in [0..M)
+    # Size the core candidate pool based on the *core* edge budget, not total.
+    # Otherwise, when f is small you dilute the "core" and lose the intended dense-like behavior.
+    Bn = int(min(M, max(2, n_triangle(J_core)))) if J_core > 0 else 0
+    B = np.argsort(q)[::-1][:Bn] if Bn > 0 else np.asarray([], dtype=np.int64)
+
+    def _degree_cap_for(J_edges: int, n_nodes_available: int) -> int:
+        """Degree cap mirroring the earlier triangular-n_target heuristic."""
+        J_edges = int(max(0, J_edges))
+        n_nodes_available = int(max(0, n_nodes_available))
+        if J_edges <= 0 or n_nodes_available <= 1:
+            return 0
+
+        n_tri_local = n_triangle(J_edges)  # nodes needed to realize J_edges (non-self)
+        n_target = n_tri_local if n_tri_local <= n_nodes_available else n_nodes_available
+        n_target = max(1, n_target)
+
+        return int(math.ceil(2.0 * J_edges / n_target))
 
     # select edges within B
     if J_core > 0 and Bn > 1:
         WB = W[np.ix_(B, B)]
-        dmax_core = int(math.ceil(2 * J_core / max(1, Bn)))
+        dmax_core = _degree_cap_for(J_core, Bn)
         edges_core = greedy_degree_capped_edges(WB, J_core, dmax_core, forbid_self=True)
         for (iB, jB) in edges_core:
             i = int(C[B[iB]])
@@ -457,7 +474,7 @@ def pairs_from_lowrank_adaptive(
 
     # wide edges: full candidates with diffuse cap
     if J_wide > 0 and M > 1:
-        dmax_wide = int(math.ceil(2 * J_wide / max(1, M)))
+        dmax_wide = _degree_cap_for(J_wide, M)
         edges_wide = greedy_degree_capped_edges(W, J_wide, dmax_wide, forbid_self=True)
         for (iC, jC) in edges_wide:
             i = int(C[iC])
@@ -472,8 +489,10 @@ def pairs_from_lowrank_adaptive(
     while len(left_pairs) < J:
         i = int(np.random.randint(0, d))
         j = int(np.random.randint(0, d))
-        if i == j:
-            continue
+        # Avoid additional self-pairs beyond the explicit n_self prefix.
+        if d > 1 and i == j:
+            j = (i + 1) % d
+        # If d == 1, self-pairs are unavoidable; allow them to prevent infinite loop.
         if (i, j) in used:
             continue
         used.add((i, j))
@@ -493,6 +512,8 @@ def pairs_from_lowrank_adaptive(
         "J_wide": int(J_wide),
         "Bn": int(Bn),
         "self": int(n_self),
+        "dmax_core": int(dmax_core) if "dmax_core" in locals() else -1,
+        "dmax_wide": int(dmax_wide) if "dmax_wide" in locals() else -1,
     }
     return left, right, diag
 
