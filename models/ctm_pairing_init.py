@@ -591,7 +591,7 @@ def initialize_ctm_pairs(
 
     with preserve_rng_state(preserve_seed), batchnorm_use_batch_stats_no_update(model), torch.inference_mode():
         it = iter(dataloader)
-        for _ in range(int(warmup_batches)):
+        for _ in tqdm(range(int(warmup_batches)), desc="Synchronization Init Warmup"):
             try:
                 batch = next(it)
             except StopIteration:
