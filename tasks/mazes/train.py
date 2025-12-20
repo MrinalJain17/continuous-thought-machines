@@ -360,7 +360,6 @@ if __name__=='__main__':
                 warmup_batches=warm_batches,
                 n_random_pairing_self=getattr(args, "n_random_pairing_self", 0),
                 batch_to_x=lambda batch: batch[0],  # mazes: (inputs, targets)
-                seed_preserve=True,
             )
 
             # One-time init diagnostics: pairing structure + init diagnostics returned by initializer
