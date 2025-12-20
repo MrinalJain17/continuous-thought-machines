@@ -205,3 +205,28 @@ class CTMStatsCollector:
             f"cos(a,o)={hs.cos_action_out:.3f} "
             f"t_star={hs.t_star}"
         )
+
+
+class SyncTickCollector:
+    def __init__(self):
+        self.action = {}
+        self.out = {}
+
+    def reset(self):
+        self.action.clear()
+        self.out.clear()
+
+    def __call__(self, tick_idx: int, role: str, sync_vec: torch.Tensor):
+        if role == "action":
+            self.action[tick_idx] = sync_vec.detach()
+        else:
+            self.out[tick_idx] = sync_vec.detach()
+
+    def get(self, role: str, tick_idx: int):
+        d = self.action if role == "action" else self.out
+        if tick_idx in d:
+            return d[tick_idx]
+        # fallback to last available
+        if len(d) == 0:
+            return None
+        return d[max(d.keys())]
