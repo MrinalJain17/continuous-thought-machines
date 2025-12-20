@@ -502,7 +502,6 @@ if __name__=='__main__':
                         z=snaps.z_star,
                         s_action=s_action_star,
                         s_out=s_out_star,
-                        certainties=cert_h,
                         t_star=t_star_i,
                     )
                     ctm_stats.log_health(bi, health)
