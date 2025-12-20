@@ -2,6 +2,7 @@ import torch
 import pytest
 import itertools
 from models.constants import VALID_NEURON_SELECT_TYPES, VALID_BACKBONE_TYPES, VALID_POSITIONAL_EMBEDDING_TYPES
+from models.ctm_pairing_init import initialize_ctm_pairs
 import numpy as np
 import random
 
