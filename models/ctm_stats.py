@@ -66,6 +66,9 @@ def _scale_free_sat(x: Tensor, mult: float = 3.0, eps: float = 1e-12) -> float:
 @dataclass(frozen=True)
 class PairGraphStats:
     J: int
+    n_self: int
+    self_prefix_frac: float
+    self_outside_prefix_frac: float
     self_frac: float
     unique_pairs_frac: float
     unique_neurons: int
@@ -104,12 +107,22 @@ class CTMStatsCollector:
         left_cpu = left.detach().to("cpu", torch.int64).numpy()
         right_cpu = right.detach().to("cpu", torch.int64).numpy()
         J = int(left_cpu.shape[0])
+        n_self = int(min(n_self, J))
 
         pairs = list(zip(left_cpu.tolist(), right_cpu.tolist()))
         unique_pairs_frac = len(set(pairs)) / max(1, J)
 
-        self_pairs = float(np.mean(left_cpu[:n_self] == right_cpu[:n_self])) if n_self > 0 else 0.0
-        # include any accidental self pairs outside prefix in self_frac
+        # Self fractions (make the contract visible)
+        if n_self > 0:
+            self_prefix_frac = float(np.mean(left_cpu[:n_self] == right_cpu[:n_self]))
+        else:
+            self_prefix_frac = 0.0
+
+        if J > n_self:
+            self_outside_prefix_frac = float(np.mean(left_cpu[n_self:] == right_cpu[n_self:]))
+        else:
+            self_outside_prefix_frac = 0.0
+
         self_frac = float(np.mean(left_cpu == right_cpu))
 
         deg_min, deg_med, deg_max, unique_neurons = _degree_stats(left_cpu, right_cpu)
@@ -118,6 +131,9 @@ class CTMStatsCollector:
 
         return PairGraphStats(
             J=J,
+            n_self=n_self,
+            self_prefix_frac=self_prefix_frac,
+            self_outside_prefix_frac=self_outside_prefix_frac,
             self_frac=self_frac,
             unique_pairs_frac=float(unique_pairs_frac),
             unique_neurons=int(unique_neurons),
@@ -128,21 +144,48 @@ class CTMStatsCollector:
             fingerprint=fp,
         )
 
-    def log_init(self, warmup_diag: Dict[str, Any], role_stats: Dict[str, PairGraphStats]) -> None:
+    def log_init(
+        self,
+        warmup_diag: Dict[str, Any],
+        role_graph: Dict[str, PairGraphStats],
+        role_policy: Dict[str, Dict[str, Any]],
+    ) -> None:
+        """
+        warmup_diag: output of initialize_ctm_pairs() top-level fields
+        role_graph: {"action": PairGraphStats, "out": PairGraphStats}
+        role_policy: {"action": diag["action"], "out": diag["out"]} (the rich init diag dicts)
+        """
         self.log_fn("=== CTM Pair Init Summary ===")
         self.log_fn(
             f"Warmup: batches={warmup_diag.get('warmup_batches')} "
             f"res_cap={warmup_diag.get('reservoir_capacity')} "
+            f"res_action={warmup_diag.get('reservoir_size_action')}/{warmup_diag.get('reservoir_seen_action')} "
+            f"res_out={warmup_diag.get('reservoir_size_out')}/{warmup_diag.get('reservoir_seen_out')} "
             f"t_star_mean={warmup_diag.get('t_star_mean'):.2f} "
             f"t_star_std={warmup_diag.get('t_star_std'):.2f}"
         )
-        for role, st in role_stats.items():
+
+        for role in ["action", "out"]:
+            st = role_graph[role]
+            pol = role_policy[role]
+
+            # Low-rank + policy diagnostics (the ones you said were “missing”)
+            k_eff = pol.get("k_eff", warmup_diag.get(role, {}).get("k_eff", -1))
+            eta = pol.get("eta", warmup_diag.get(role, {}).get("eta", float("nan")))
+
             self.log_fn(
-                f"[{role}] J={st.J} self_frac={st.self_frac:.3f} "
+                f"[{role}] "
+                f"J={st.J} n_self={st.n_self} "
+                f"self_prefix={st.self_prefix_frac:.3f} self_outside={st.self_outside_prefix_frac:.3f} self_total={st.self_frac:.3f} "
                 f"unique_pairs={st.unique_pairs_frac:.3f} "
                 f"unique_neurons={st.unique_neurons} "
                 f"deg(min/med/max)={st.deg_min}/{st.deg_med:.1f}/{st.deg_max} "
                 f"top1%_incident={st.top1pct_incident:.3f} "
+                f"k_eff={int(k_eff)} eta={float(eta):.3f} "
+                f"M={int(pol.get('M', -1))} n_eff={float(pol.get('n_eff', float('nan'))):.1f} "
+                f"f={float(pol.get('f_bottleneck', float('nan'))):.3f} "
+                f"J_core={int(pol.get('J_core', -1))} J_wide={int(pol.get('J_wide', -1))} "
+                f"Bn={int(pol.get('Bn', -1))} dmax_core={int(pol.get('dmax_core', -1))} dmax_wide={int(pol.get('dmax_wide', -1))} "
                 f"fp={st.fingerprint}"
             )
 

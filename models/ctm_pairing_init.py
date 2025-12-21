@@ -1,10 +1,70 @@
+"""
+CTM Synchronization Pair Initialization (nonlinear feature map, linear kernel)
+
+Goal
+----
+We want to initialize CTM “random pairing” indices (left,right) for each role
+(action / out) using *data-driven* structure, but with:
+  - no task-specific knobs,
+  - stable behavior across tasks.
+
+Mental model
+------------
+Let z(x,t) ∈ R^D be the CTM activated state at internal tick t for an input x.
+We collect representative states from a short warmup:
+
+  - z★ := state at the tick with maximum step-to-step change (proxy for “most dynamic”)
+  - zT := final tick state (“settled”)
+
+We build a matrix X whose rows are standardized samples of a transformed state:
+
+  x_row = standardize( g( rms_norm(z) ) )
+
+where:
+  - rms_norm makes each row comparable (scale-stable)
+  - standardize (online) makes features comparable (dimension-wise)
+  - g(·) is a *nonlinear feature map* applied elementwise.
+
+Then, we compute a low-rank approximation to the (linear) Gram proxy:
+
+  K ≈ X^T X   (DxD)
+  X ≈ U diag(S) V^T    (SVD)
+  => K ≈ V diag(S^2) V^T
+
+Neuron “importance” comes from leverage scores:
+  lev_i = ||V[i,:]||^2
+
+We sample a candidate set C (size M ≪ D) using p_i (tempered leverage),
+build a small |K_C|, and pick J edges (pairs) by greedy highest-score edges
+under a degree cap.
+
+Nonlinearity choice
+-------------------
+We default to a robust, universal feature map:
+
+  g(x) = sign(x) * sqrt(|x| + eps)
+
+Why: it compresses heavy tails *without* hard saturation, preserves sign,
+and tends to be stable across tasks with different activation regimes
+(mazes, image-like tasks, etc.). It is a classic variance-stabilizing transform.
+
+Where it lives: inside the reservoir ingestion, *before* standardization.
+
+Practical notes
+---------------
+- Warmup runs under torch.inference_mode() and disables dropout while preserving BN batch stats,
+  so it measures realistic forward activations without training-side noise or BN drift.
+- This module does not compute loss. It estimates statistics from forward dynamics only.
+- We keep memory bounded with a reservoir sampler.
+"""
+
 from __future__ import annotations
 
 import contextlib
 import math
 import random
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple, Literal
 
 import numpy as np
 import torch
@@ -15,20 +75,18 @@ from sklearn.utils.extmath import randomized_svd
 
 
 Tensor = torch.Tensor
+FeatureMap = Literal["identity", "signed_sqrt", "tanh", "abs", "square"]
 
 
 # ---------------------------------------------------------------------------
-# 1) Warmup forward mode
+# 1) Warmup forward mode (RNG-safe, BN-safe)
 # ---------------------------------------------------------------------------
 
 @contextlib.contextmanager
 def preserve_rng_state(enabled: bool = True):
-    """Preserve and restore RNG states for python/numpy/torch (+cuda).
+    """Preserve and restore python/numpy/torch (+cuda) RNG.
 
-    Rationale:
-      Pair initialization should not accidentally perturb training randomness
-      (data augmentation, dropout, etc.). This context keeps init "side-effect-free"
-      with respect to RNG streams when enabled.
+    Ensures pair initialization does not perturb training randomness streams.
     """
     if not enabled:
         yield
@@ -49,22 +107,11 @@ def preserve_rng_state(enabled: bool = True):
 
 @contextlib.contextmanager
 def batchnorm_use_batch_stats_no_update(model: nn.Module):
-    """Warmup mode that avoids polluting correlations with dropout but keeps BN realistic.
-
-    Goal:
-      Warmup should approximate training-time forward activations (BN batch stats),
-      but must not mutate BN running_mean/var (to remain minimally invasive).
-
-    Mechanism:
-      - set model.eval() to disable dropout and other train-time stochasticity
-      - force BN modules into train mode so they use batch stats
-      - set BN momentum=0 to avoid running-stat drift
-      - snapshot/restore BN buffers and training flags
-    """
+    """Disable dropout but keep BN batch stats; do not update BN running stats."""
     saved_bn: List[Tuple[nn.Module, Dict[str, Any]]] = []
     model_training = model.training
     try:
-        model.eval()
+        model.eval()  # disables dropout
         for m in model.modules():
             if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d, nn.SyncBatchNorm)):
                 st: Dict[str, Any] = {"training": m.training, "momentum": m.momentum}
@@ -75,8 +122,9 @@ def batchnorm_use_batch_stats_no_update(model: nn.Module):
                 if getattr(m, "num_batches_tracked", None) is not None:
                     st["num_batches_tracked"] = m.num_batches_tracked.detach().clone()
                 saved_bn.append((m, st))
-                m.train(True)
-                m.momentum = 0.0
+
+                m.train(True)      # BN uses batch stats
+                m.momentum = 0.0   # prevent running-stat drift
         yield
     finally:
         for m, st in saved_bn:
@@ -92,7 +140,7 @@ def batchnorm_use_batch_stats_no_update(model: nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# 2) Tick representative snapshots: Z_star (max-change) and Z_last
+# 2) Tick representative snapshots
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -104,15 +152,7 @@ class TickSnapshots:
 
 
 class TickRepresentativeCollector:
-    """Select representative internal ticks without storing all ticks.
-
-    We want a label-free, task-agnostic snapshot that captures *dynamics*.
-    A simple and robust proxy is:
-      Z_star := state at tick with maximal step-to-step change (mean L2 over batch)
-      Z_last := state at final tick
-
-    This requires only streaming comparison with the previous tick.
-    """
+    """Pick z★ (max change) and zT (final) without storing all ticks."""
     def __init__(self):
         self.prev: Optional[Tensor] = None
         self.best_delta: float = -1.0
@@ -148,35 +188,36 @@ class TickRepresentativeCollector:
 
 
 # ---------------------------------------------------------------------------
-# 3) Streaming standardization + reservoir sampling
+# 3) Reservoir + online standardization + Tier-0 feature map
 # ---------------------------------------------------------------------------
 
 def _rms_normalize_rows(z: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-    """Row-wise RMS normalization: z / sqrt(mean(z^2)+eps)."""
     rms = np.sqrt(np.mean(z * z, axis=1, keepdims=True) + eps)
     return z / rms
 
 
+def apply_feature_map(z: np.ndarray, kind: FeatureMap, eps: float = 1e-8) -> np.ndarray:
+    """Elementwise feature map g(z). Keeps shape (B,D)."""
+    if kind == "identity":
+        return z
+    if kind == "signed_sqrt":
+        return np.sign(z) * np.sqrt(np.abs(z) + eps)
+    if kind == "tanh":
+        return np.tanh(z)
+    if kind == "abs":
+        return np.abs(z)
+    if kind == "square":
+        return z * z
+    raise ValueError(f"Unknown feature_map: {kind}")
+
+
 class Reservoir:
-    """Uniform reservoir sampler over rows, with streaming standardization via sklearn.
-
-    Mental model:
-      We need a stable low-rank Gram proxy. That requires:
-        (a) many activation samples,
-        (b) robust standardization,
-        (c) bounded memory.
-
-      We therefore:
-        - RMS-normalize each row to damp scale drift
-        - update a StandardScaler online (mean/var over all seen rows)
-        - retain a uniform reservoir sample of fixed size for PCA/SVD
-
-    This gives a dataset-agnostic activation matrix X without storing everything.
-    """
-    def __init__(self, d: int, capacity: int, clip: float = 5.0):
+    """Bounded-memory activation store with online standardization."""
+    def __init__(self, d: int, capacity: int, *, clip: float = 5.0, feature_map: FeatureMap = "signed_sqrt"):
         self.d = int(d)
         self.capacity = int(capacity)
         self.clip = float(clip)
+        self.feature_map: FeatureMap = feature_map
 
         self.scaler = StandardScaler(with_mean=True, with_std=True)
         self.n_seen = 0
@@ -186,12 +227,14 @@ class Reservoir:
     def add_batch(self, z_torch: Tensor):
         if z_torch is None or z_torch.numel() == 0:
             return
-        z = z_torch.detach().to(device="cpu", dtype=torch.float32).numpy()
-        z = _rms_normalize_rows(z)  # (B,D)
+        z = z_torch.detach().to(device="cpu", dtype=torch.float32).numpy()  # (B,D)
+        z = _rms_normalize_rows(z)
+        z = apply_feature_map(z, self.feature_map)
+
         self.scaler.partial_fit(z)
 
         b = z.shape[0]
-        # fill
+        # Fill
         if self.size < self.capacity:
             n_fill = min(self.capacity - self.size, b)
             self.data[self.size:self.size + n_fill] = z[:n_fill]
@@ -201,9 +244,8 @@ class Reservoir:
         if z.size == 0:
             return
 
-        # replacement (vectorized reservoir)
+        # Replacement (vectorized uniform reservoir)
         br = z.shape[0]
-        # indices sampled uniformly in [0, n_seen + t]
         n_seen_t = self.n_seen + np.arange(1, br + 1, dtype=np.int64)
         j = (np.random.rand(br) * n_seen_t.astype(np.float64)).astype(np.int64)
         mask = j < self.capacity
@@ -212,64 +254,46 @@ class Reservoir:
         self.n_seen += br
 
     def finalize_X(self) -> np.ndarray:
-        """Return standardized reservoir matrix X in float32."""
+        """Return standardized, clipped reservoir matrix X (N,D)."""
         if self.size < 2:
             return np.empty((0, self.d), dtype=np.float32)
         mu = self.scaler.mean_.astype(np.float32, copy=False)
         std = np.sqrt(self.scaler.var_.astype(np.float32, copy=False) + 1e-12)
         X = (self.data[:self.size] - mu[None, :]) / (std[None, :] + 1e-8)
-        if self.clip is not None:
-            X = np.clip(X, -self.clip, self.clip)
+        X = np.clip(X, -self.clip, self.clip)
         return X.astype(np.float32, copy=False)
 
 
 # ---------------------------------------------------------------------------
-# 4) Low-rank Gram proxy + adaptive bottleneck allocation
+# 4) Low-rank Gram proxy -> leverage-tempered importance p
 # ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class LowRank:
     V: np.ndarray      # (D,k_eff)
     S: np.ndarray      # (k_eff,)
-    p: np.ndarray      # (D,) leverage-tempered importance
-    eta: float         # explained energy proxy
+    p: np.ndarray      # (D,)
+    eta: float         # energy ratio
     k_eff: int
 
 
 def lowrank_from_X(X: np.ndarray, d: int, k: int) -> LowRank:
-    """Compute low-rank factors + a neuron importance distribution.
-
-    We use randomized SVD for robustness and speed on CPU.
-    From X (N,D), we compute top k singular values/vectors:
-      X ≈ U diag(S) V^T
-
-    Neuron "leverage" (importance) is:
-      lev_i = ||V[i,:]||^2
-
-    We temper lev toward uniform by how much energy the top-k captures:
-      eta = sum(S^2) / ||X||_F^2
-      alpha = 1 - eta
-      p = (1-alpha)*lev_norm + alpha*uniform
-    """
     if X.size == 0 or X.shape[0] < 2:
         p = np.full((d,), 1.0 / d, dtype=np.float32)
         return LowRank(V=np.zeros((d, 0), np.float32), S=np.zeros((0,), np.float32), p=p, eta=0.0, k_eff=0)
 
-    Xc = X - X.mean(axis=0, keepdims=True)  # safe even if already standardized
+    Xc = X - X.mean(axis=0, keepdims=True)
     N = Xc.shape[0]
     k_eff = int(min(k, d, max(1, min(N - 1, k))))
 
-    # randomized_svd returns Vt: (k_eff,D)
-    _, S, Vt = randomized_svd(Xc, n_components=k_eff, n_iter=2, random_state=None)
+    # Deterministic randomized SVD is preferred for reproducibility and testing.
+    _, S, Vt = randomized_svd(Xc, n_components=k_eff, n_iter=2, random_state=0)
     V = Vt.T.astype(np.float32, copy=False)
     S = S.astype(np.float32, copy=False)
 
     lev = np.sum(V * V, axis=1).astype(np.float64)
     lev_sum = float(np.sum(lev))
-    if lev_sum <= 0:
-        lev = np.full((d,), 1.0 / d, dtype=np.float64)
-    else:
-        lev = lev / lev_sum
+    lev = (lev / lev_sum) if lev_sum > 0 else np.full((d,), 1.0 / d, dtype=np.float64)
 
     fro2 = float(np.sum(Xc * Xc))
     top2 = float(np.sum(S * S))
@@ -282,6 +306,10 @@ def lowrank_from_X(X: np.ndarray, d: int, k: int) -> LowRank:
 
     return LowRank(V=V, S=S, p=p, eta=eta, k_eff=k_eff)
 
+
+# ---------------------------------------------------------------------------
+# 5) Candidate Gram + greedy degree-capped edge selection
+# ---------------------------------------------------------------------------
 
 def n_triangle(J: int) -> int:
     """Smallest n such that n(n-1)/2 >= J (i.e., J distinct non-self edges)."""
@@ -301,137 +329,131 @@ def sample_without_replacement(p: np.ndarray, m: int) -> np.ndarray:
 
 
 def gram_abs_from_factors(V: np.ndarray, S: np.ndarray, idx: np.ndarray) -> np.ndarray:
-    """Compute |K| on a candidate set from low-rank factors.
-
-    If K ≈ V diag(S^2) V^T, then on candidates C:
-      K_C = (V_C diag(S)) (V_C diag(S))^T
-    """
     A = (V[idx, :] * S[None, :]).astype(np.float32, copy=False)  # (M,k)
     G = np.abs(A @ A.T).astype(np.float32, copy=False)          # (M,M)
     np.fill_diagonal(G, 0.0)
     return G
 
 
+def greedy_degree_capped_edges(W: np.ndarray, J: int, d_max: int) -> List[Tuple[int, int]]:
+    """Deterministic greedy: accept largest scores under per-node degree cap."""
+    M = W.shape[0]
+    if M <= 1 or J <= 0:
+        return []
+    tri_i, tri_j = np.triu_indices(M, k=1)
+    scores = W[tri_i, tri_j]
+    order = np.argsort(scores)[::-1]
+
+    deg = np.zeros((M,), dtype=np.int32)
+    out: List[Tuple[int, int]] = []
+    for k in order:
+        if len(out) >= J:
+            break
+        if scores[k] <= 0:
+            break
+        i = int(tri_i[k])
+        j = int(tri_j[k])
+        if deg[i] >= d_max or deg[j] >= d_max:
+            continue
+        out.append((i, j))
+        deg[i] += 1
+        deg[j] += 1
+    return out
+
+
 def participation_ratio(q: np.ndarray) -> float:
-    """Effective support size: 1 / sum(q^2)."""
     q = np.asarray(q, dtype=np.float64)
     q = np.maximum(q, 1e-12)
     q = q / np.sum(q)
     return float(1.0 / np.sum(q * q))
 
 
-# ---------------------------------------------------------------------------
-# 5) Deterministic greedy edge selection with degree caps
-# ---------------------------------------------------------------------------
-
-def greedy_degree_capped_edges(
-    W: np.ndarray,
-    J: int,
-    d_max: int,
-    forbid_self: bool = True,
-) -> List[Tuple[int, int]]:
-    """Pick up to J edges from W (square, nonnegative) via greedy score order under degree cap.
-
-    This is the minimal “workhorse” primitive:
-      - score is W_ij
-      - accept highest score edges while degrees <= d_max
-      - deterministic given W and tie ordering from argsort
-
-    Complexity is fine for M<=1024 once at init time.
-    """
-    M = W.shape[0]
-    if M <= 1 or J <= 0:
-        return []
-
-    tri_i, tri_j = np.triu_indices(M, k=1 if forbid_self else 0)
-    scores = W[tri_i, tri_j]
-
-    order = np.argsort(scores)[::-1]
-    deg = np.zeros((M,), dtype=np.int32)
-    out: List[Tuple[int, int]] = []
-
-    for k in order:
-        if len(out) >= J:
-            break
-        i = int(tri_i[k])
-        j = int(tri_j[k])
-        if forbid_self and i == j:
-            continue
-        if deg[i] >= d_max or deg[j] >= d_max:
-            continue
-        if scores[k] <= 0:
-            break
-        out.append((i, j))
-        deg[i] += 1
-        deg[j] += 1
-
-    return out
-
-
-def pairs_from_lowrank_adaptive(
+def pairs_from_lowrank(
     factors: LowRank,
+    *,
     J: int,
     n_self: int,
     d: int,
     M: int,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
-    """Adaptive universal pairing policy from low-rank kernel proxy.
+    """Single universal policy (same for action/out).
 
-    Mental model:
-      - Build a small candidate Gram proxy |K_C| of size MxM
-      - Measure hubness distribution q over candidates from row-sums of |K_C|
-      - Infer whether the kernel is bottleneck-friendly via n_eff(q)
-      - Allocate edges: J_core (bottlenecked within top hubs) + J_wide (coverage)
-      - Select edges deterministically by greedy degree-capped scores
+    Steps:
+      - Candidate set C ~ p (size M)
+      - Build |K_C| from low-rank proxy
+      - Compute hubness q from row-sums of |K_C|
+      - Greedy select J edges under a degree cap
 
-    This yields a universal default:
-      - If kernel has strong hubs: behaves dense-like (helps tasks like mazes)
-      - If kernel diffuse: behaves coverage-like (helps perceptual tasks)
-      - No task flags; no tuning knobs.
+    This avoids role-specific coverage logic; hubness in the kernel decides.
     """
     J = int(J)
     d = int(d)
     n_self = int(min(n_self, max(0, J - 1)))
 
-    # fallback for missing factors
     if factors.k_eff <= 0:
-        left = np.random.randint(0, d, size=J, dtype=np.int64)
-        right = np.random.randint(0, d, size=J, dtype=np.int64)
-        # enforce exact self-prefix if requested
+        J = int(J)
+        d = int(d)
+        n_self = int(min(n_self, max(0, J - 1)))
+
+        left_pairs: List[int] = []
+        right_pairs: List[int] = []
+        used = set()
+
+        # Self-prefix: deterministic-ish even in fallback
         if n_self > 0:
-            top = np.argsort(factors.p)[::-1][:n_self]
-            left[:n_self] = top
-            right[:n_self] = top
-        return left, right, {"mode": "uniform_fallback"}
+            # factors.p exists even in fallback in your lowrank_from_X; if not, use uniform.
+            p = getattr(factors, "p", None)
+            if p is None or len(p) != d:
+                top = np.arange(d, dtype=np.int64)[:n_self]
+            else:
+                top = np.argsort(p)[::-1][:n_self].astype(np.int64)
 
-    # choose candidate set C
+            for idx in top.tolist():
+                left_pairs.append(int(idx))
+                right_pairs.append(int(idx))
+                used.add((int(idx), int(idx)))
+
+        # Fill remaining with uniform non-self pairs when possible, avoiding duplicates.
+        while len(left_pairs) < J:
+            i = int(np.random.randint(0, d))
+            j = int(np.random.randint(0, d))
+
+            # Avoid additional self-pairs beyond the explicit prefix.
+            if d > 1 and i == j:
+                j = (i + 1) % d
+            # If d == 1, self-pairs are unavoidable; allow them to terminate.
+            if (i, j) in used:
+                continue
+
+            used.add((i, j))
+            left_pairs.append(i)
+            right_pairs.append(j)
+
+        left = np.asarray(left_pairs[:J], dtype=np.int64)
+        right = np.asarray(right_pairs[:J], dtype=np.int64)
+
+        return left, right, {"mode": "uniform_fallback", "self": int(n_self)}
+
+
+    M = int(min(M, d))
     C = sample_without_replacement(factors.p, M)  # indices in [0..D)
-    G = gram_abs_from_factors(factors.V[:, :factors.k_eff], factors.S[:factors.k_eff], C)  # (M,M)
+    G = gram_abs_from_factors(factors.V[:, :factors.k_eff], factors.S[:factors.k_eff], C)
 
-    # hubness q over candidates
     s = np.sum(G, axis=1).astype(np.float64)
     s = np.maximum(s, 1e-12)
     q = (s / np.sum(s)).astype(np.float32, copy=False)
     n_eff = participation_ratio(q)
 
-    # Non-self edges are what the graph sampler actually selects (self edges are forced prefix).
-    J_nonself = J - n_self
-    n_tri = n_triangle(J_nonself)  # node-count implied by the non-self edge budget
-    f = float(min(1.0, n_tri / max(1e-6, n_eff)))  # bottleneck fraction inferred from kernel
-
-    J_core = int(round(f * J_nonself))
-    J_wide = J_nonself - J_core
-
-    # build scores on candidates: W_ij = |K_ij| * sqrt(q_i q_j)
+    # Score edges by |K_ij| weighted by sqrt(q_i q_j)
     sqrt_q = np.sqrt(q.astype(np.float64) + 1e-12)
     W = (G * (sqrt_q[:, None] * sqrt_q[None, :]).astype(np.float32)).astype(np.float32, copy=False)
     np.fill_diagonal(W, 0.0)
 
-    # self-pairs: choose top candidates by q, mapped back to global indices
     left_pairs: List[int] = []
     right_pairs: List[int] = []
     used = set()
 
+    # self-pairs: top-q candidates (mapped to global)
     if n_self > 0:
         top_local = np.argsort(q)[::-1][:n_self]
         top_global = C[top_local]
@@ -440,52 +462,24 @@ def pairs_from_lowrank_adaptive(
             right_pairs.append(int(idx))
             used.add((int(idx), int(idx)))
 
-    # Size the core candidate pool based on the *core* edge budget, not total.
-    # Otherwise, when f is small you dilute the "core" and lose the intended dense-like behavior.
-    Bn = int(min(M, max(2, n_triangle(J_core)))) if J_core > 0 else 0
-    B = np.argsort(q)[::-1][:Bn] if Bn > 0 else np.asarray([], dtype=np.int64)
+    J_nonself = J - n_self
+    n_tri = n_triangle(J_nonself)
+    # Degree cap: a single, interpretable cap derived from a dense-equivalent support size.
+    # If the kernel is hubbier, greedy will naturally concentrate; if diffuse, it spreads.
+    n_target = int(min(M, max(1, n_tri)))
+    d_max = int(math.ceil(2 * J_nonself / max(1, n_target)))
 
-    def _degree_cap_for(J_edges: int, n_nodes_available: int) -> int:
-        """Degree cap mirroring the earlier triangular-n_target heuristic."""
-        J_edges = int(max(0, J_edges))
-        n_nodes_available = int(max(0, n_nodes_available))
-        if J_edges <= 0 or n_nodes_available <= 1:
-            return 0
+    edges = greedy_degree_capped_edges(W, J_nonself, d_max)
+    for (iC, jC) in edges:
+        i = int(C[iC])
+        j = int(C[jC])
+        if (i, j) in used or i == j:
+            continue
+        used.add((i, j))
+        left_pairs.append(i)
+        right_pairs.append(j)
 
-        n_tri_local = n_triangle(J_edges)  # nodes needed to realize J_edges (non-self)
-        n_target = n_tri_local if n_tri_local <= n_nodes_available else n_nodes_available
-        n_target = max(1, n_target)
-
-        return int(math.ceil(2.0 * J_edges / n_target))
-
-    # select edges within B
-    if J_core > 0 and Bn > 1:
-        WB = W[np.ix_(B, B)]
-        dmax_core = _degree_cap_for(J_core, Bn)
-        edges_core = greedy_degree_capped_edges(WB, J_core, dmax_core, forbid_self=True)
-        for (iB, jB) in edges_core:
-            i = int(C[B[iB]])
-            j = int(C[B[jB]])
-            if (i, j) in used or i == j:
-                continue
-            used.add((i, j))
-            left_pairs.append(i)
-            right_pairs.append(j)
-
-    # wide edges: full candidates with diffuse cap
-    if J_wide > 0 and M > 1:
-        dmax_wide = _degree_cap_for(J_wide, M)
-        edges_wide = greedy_degree_capped_edges(W, J_wide, dmax_wide, forbid_self=True)
-        for (iC, jC) in edges_wide:
-            i = int(C[iC])
-            j = int(C[jC])
-            if (i, j) in used or i == j:
-                continue
-            used.add((i, j))
-            left_pairs.append(i)
-            right_pairs.append(j)
-
-    # If we didn't reach J, fill remaining uniformly (guaranteed termination, no extra self pairs)
+    # Guaranteed fill if greedy under-fills (rare but safe)
     while len(left_pairs) < J:
         i = int(np.random.randint(0, d))
         j = int(np.random.randint(0, d))
@@ -499,35 +493,20 @@ def pairs_from_lowrank_adaptive(
         left_pairs.append(i)
         right_pairs.append(j)
 
-    left = np.asarray(left_pairs[:J], dtype=np.int64)
-    right = np.asarray(right_pairs[:J], dtype=np.int64)
-
     diag = {
-        "mode": "adaptive",
+        "mode": "lowrank_greedy",
         "M": int(M),
-        "n_tri": int(n_tri),
-        "n_eff": float(n_eff),
-        "f_bottleneck": float(f),
-        "J_core": int(J_core),
-        "J_wide": int(J_wide),
-        "Bn": int(Bn),
         "self": int(n_self),
-        "dmax_core": int(dmax_core) if "dmax_core" in locals() else -1,
-        "dmax_wide": int(dmax_wide) if "dmax_wide" in locals() else -1,
+        "n_eff": float(n_eff),
+        "n_tri": int(n_tri),
+        "d_max": int(d_max),
     }
-    return left, right, diag
+    return np.asarray(left_pairs[:J], np.int64), np.asarray(right_pairs[:J], np.int64), diag
 
 
 # ---------------------------------------------------------------------------
-# 6) Task-agnostic initialization entrypoint
+# 6) Entrypoint: warmup -> reservoirs -> low-rank -> pairs -> write into model
 # ---------------------------------------------------------------------------
-
-def default_warmup_batches(args_warmup_steps: int) -> int:
-    """Occam default: warmup is about statistics, not LR scheduling."""
-    if args_warmup_steps and args_warmup_steps > 0:
-        return int(min(1024, args_warmup_steps))
-    return 1024
-
 
 def _default_batch_to_x(batch: Any) -> Tensor:
     if isinstance(batch, Tensor):
@@ -543,29 +522,15 @@ def initialize_ctm_pairs(
     *,
     warmup_batches: int,
     n_random_pairing_self: int,
+    feature_map: FeatureMap = "signed_sqrt",
     device: Optional[torch.device | str] = None,
     batch_to_x: Optional[Callable[[Any], Tensor]] = None,
     preserve_seed: bool = True,
+    show_progress: bool = True,
 ) -> Dict[str, Any]:
-    """One-shot pairing initialization for CTM (action/out), task-agnostic.
-
-    Expected model interface:
-      - attributes: d_model, n_synch_action, n_synch_out
-      - methods:
-          resample_action_pairs_(n_random_pairing_self: int)  [optional but recommended]
-          set_neuron_pairs(role: str, left: Tensor, right: Tensor)
-      - forward signature: model(x, track=False, callback=collector)
-
-    High-level algorithm:
-      1) Warmup: gather Z_star (and Z_last) states from real data forwards
-      2) Build standardized reservoir matrices X_action, X_out
-      3) Estimate low-rank Gram proxy factors for each role
-      4) Sample pairs using adaptive bottleneck allocation from kernel hubness
-      5) Write indices into model buffers once
-    """
+    """Task-agnostic CTM pair initialization (same policy for action and out)."""
     if batch_to_x is None:
         batch_to_x = _default_batch_to_x
-
     if device is None:
         try:
             device = next(model.parameters()).device
@@ -577,21 +542,24 @@ def initialize_ctm_pairs(
     J_action = int(getattr(model, "n_synch_action"))
     J_out = int(getattr(model, "n_synch_out"))
 
-    # design constants
+    # bounded compute knobs (not task knobs)
     k = int(min(256, d))
-    n_res = int(min(32768, 32 * k))  # bounded memory
-    M = int(min(d, 4 * k))           # bounded quadratic object
+    n_res = int(min(32768, 32 * k))
+    M = int(min(d, 4 * k))
 
-    # reservoirs (role-specific)
-    res_action = Reservoir(d=d, capacity=n_res, clip=5.0)
-    res_out = Reservoir(d=d, capacity=n_res, clip=5.0)
+    res_action = Reservoir(d=d, capacity=n_res, clip=5.0, feature_map=feature_map)
+    res_out = Reservoir(d=d, capacity=n_res, clip=5.0, feature_map=feature_map)
 
     collector = TickRepresentativeCollector()
     tstars: List[int] = []
 
-    with preserve_rng_state(preserve_seed), batchnorm_use_batch_stats_no_update(model), torch.inference_mode():
+    rng_ctx = preserve_rng_state(preserve_seed)
+    bn_ctx = batchnorm_use_batch_stats_no_update(model)
+    pbar = tqdm(range(int(warmup_batches)), desc="CTM Pair Init Warmup") if show_progress else range(int(warmup_batches))
+
+    with rng_ctx, bn_ctx, torch.inference_mode():
         it = iter(dataloader)
-        for _ in tqdm(range(int(warmup_batches)), desc="Synchronization Init Warmup"):
+        for _ in pbar:
             try:
                 batch = next(it)
             except StopIteration:
@@ -600,21 +568,21 @@ def initialize_ctm_pairs(
 
             x = batch_to_x(batch).to(device, non_blocking=True)
 
-            # Break circularity: resample action pairs only (action affects trajectories)
+            # Break circularity: resample action pairs during warmup if available.
             if hasattr(model, "resample_action_pairs_"):
                 model.resample_action_pairs_(int(n_random_pairing_self))
 
             collector.reset()
             _ = model(x, track=False, callback=collector)
             snaps = collector.snapshots()
+
             if snaps.t_star is not None:
                 tstars.append(int(snaps.t_star))
             if snaps.z_star is None or snaps.z_last is None:
                 continue
 
-            # action: Z_star only
+            # action uses z★; out uses z★ and zT
             res_action.add_batch(snaps.z_star)
-            # out: Z_star + Z_last
             res_out.add_batch(snaps.z_star)
             res_out.add_batch(snaps.z_last)
 
@@ -624,18 +592,27 @@ def initialize_ctm_pairs(
     factors_action = lowrank_from_X(X_action, d=d, k=k)
     factors_out = lowrank_from_X(X_out, d=d, k=k)
 
-    left_a, right_a, diag_a = pairs_from_lowrank_adaptive(
+    left_a, right_a, diag_a = pairs_from_lowrank(
         factors_action, J=J_action, n_self=n_random_pairing_self, d=d, M=M
     )
-    left_o, right_o, diag_o = pairs_from_lowrank_adaptive(
+    left_o, right_o, diag_o = pairs_from_lowrank(
         factors_out, J=J_out, n_self=n_random_pairing_self, d=d, M=M
     )
 
-    model.set_neuron_pairs("action", torch.from_numpy(left_a).to(device=device), torch.from_numpy(right_a).to(device=device))
-    model.set_neuron_pairs("out", torch.from_numpy(left_o).to(device=device), torch.from_numpy(right_o).to(device=device))
+    model.set_neuron_pairs(
+        "action",
+        torch.from_numpy(left_a).to(device=device),
+        torch.from_numpy(right_a).to(device=device),
+    )
+    model.set_neuron_pairs(
+        "out",
+        torch.from_numpy(left_o).to(device=device),
+        torch.from_numpy(right_o).to(device=device),
+    )
 
     t_arr = np.asarray(tstars, dtype=np.float32) if tstars else np.asarray([0.0], dtype=np.float32)
-    diag = {
+    return {
+        "feature_map": feature_map,
         "warmup_batches": int(warmup_batches),
         "reservoir_capacity": int(n_res),
         "reservoir_size_action": int(res_action.size),
@@ -644,17 +621,6 @@ def initialize_ctm_pairs(
         "reservoir_seen_out": int(res_out.n_seen),
         "t_star_mean": float(np.mean(t_arr)),
         "t_star_std": float(np.std(t_arr)),
-        "action": {
-            "J": int(J_action),
-            "k_eff": int(factors_action.k_eff),
-            "eta": float(factors_action.eta),
-            **diag_a,
-        },
-        "out": {
-            "J": int(J_out),
-            "k_eff": int(factors_out.k_eff),
-            "eta": float(factors_out.eta),
-            **diag_o,
-        },
+        "action": {"J": int(J_action), "k_eff": int(factors_action.k_eff), "eta": float(factors_action.eta), **diag_a},
+        "out": {"J": int(J_out), "k_eff": int(factors_out.k_eff), "eta": float(factors_out.eta), **diag_o},
     }
-    return diag

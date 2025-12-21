@@ -377,7 +377,15 @@ if __name__=='__main__':
                     n_self=getattr(args, "n_random_pairing_self", 0),
                 ),
             }
-            ctm_stats.log_init(init_diag if init_diag is not None else {}, role_stats)
+            init_diag = init_diag if init_diag is not None else {}
+            ctm_stats.log_init(
+                init_diag,
+                role_stats,
+                role_diag={
+                    "action": init_diag.get("action", {}),
+                    "out": init_diag.get("out", {}),
+                }
+            )
 
             # Optional (init-time only): export edge lists for Gephi
             ctm_stats.export_gephi_csv(f"{args.log_dir}/pair_graph_action.csv", "action",
