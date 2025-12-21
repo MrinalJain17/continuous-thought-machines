@@ -33,6 +33,7 @@ python -m tasks.mazes.train \
     --n_synch_out 128 \
     --n_synch_action 128 \
     --neuron_select_type random-pairing \
+    --n_random_pairing_self 16 \
     --memory_length 25 \
     --memory_hidden_dims 32 \
     --maze_route_length 50 \

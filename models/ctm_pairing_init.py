@@ -508,6 +508,12 @@ def pairs_from_lowrank(
 # 6) Entrypoint: warmup -> reservoirs -> low-rank -> pairs -> write into model
 # ---------------------------------------------------------------------------
 
+def default_warmup_batches(args_warmup_steps: int) -> int:
+    """Occam default: warmup is about statistics, not LR scheduling."""
+    if args_warmup_steps and args_warmup_steps > 0:
+        return int(min(1024, args_warmup_steps))
+    return 1024
+
 def _default_batch_to_x(batch: Any) -> Tensor:
     if isinstance(batch, Tensor):
         return batch
