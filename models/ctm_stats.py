@@ -11,16 +11,20 @@ import torch
 Tensor = torch.Tensor
 
 
+# -----------------------------------------------------------------------------
+# Helpers
+# -----------------------------------------------------------------------------
+
 def _stable_hash_pairs(left: Tensor, right: Tensor) -> str:
-    # Stable fingerprint across runs (device-agnostic).
+    """Stable fingerprint across runs (device-agnostic)."""
     a = left.detach().to("cpu", torch.int64).numpy().tobytes()
     b = right.detach().to("cpu", torch.int64).numpy().tobytes()
     return hashlib.sha256(a + b).hexdigest()[:12]
 
 
 def _degree_stats(left: np.ndarray, right: np.ndarray) -> Tuple[int, float, int, int]:
-    # undirected degrees on the induced endpoint set
-    deg = {}
+    """Undirected degree stats on the induced endpoint set."""
+    deg: Dict[int, int] = {}
     for u, v in zip(left.tolist(), right.tolist()):
         deg[u] = deg.get(u, 0) + 1
         deg[v] = deg.get(v, 0) + 1
@@ -31,17 +35,19 @@ def _degree_stats(left: np.ndarray, right: np.ndarray) -> Tuple[int, float, int,
 
 
 def _top_frac_incident(left: np.ndarray, right: np.ndarray, top_frac: float = 0.01) -> float:
-    # fraction of edges incident to top-degree nodes (hub concentration)
-    deg = {}
+    """Fraction of edges incident to top-degree nodes (hub concentration)."""
+    deg: Dict[int, int] = {}
     for u, v in zip(left.tolist(), right.tolist()):
         deg[u] = deg.get(u, 0) + 1
         deg[v] = deg.get(v, 0) + 1
     if not deg:
         return 0.0
+
     nodes = np.array(list(deg.keys()), dtype=np.int64)
-    dvals = np.array([deg[n] for n in nodes], dtype=np.int64)
+    dvals = np.array([deg[int(n)] for n in nodes], dtype=np.int64)
     k = max(1, int(np.ceil(top_frac * len(nodes))))
     top_nodes = set(nodes[np.argsort(dvals)[::-1][:k]].tolist())
+
     incident = 0
     for u, v in zip(left.tolist(), right.tolist()):
         if u in top_nodes or v in top_nodes:
@@ -50,18 +56,36 @@ def _top_frac_incident(left: np.ndarray, right: np.ndarray, top_frac: float = 0.
 
 
 def _scale_free_near0(x: Tensor, frac: float = 1e-2, eps: float = 1e-12) -> float:
-    # near0 = P(|x| < frac * RMS(x)), dimensionless
+    """near0 = P(|x| < frac * RMS(x)), dimensionless."""
     xrms = torch.sqrt((x * x).mean(dim=-1, keepdim=True) + eps)
     thr = frac * xrms
     return float((x.abs() < thr).float().mean().item())
 
 
 def _scale_free_sat(x: Tensor, mult: float = 3.0, eps: float = 1e-12) -> float:
-    # saturation proxy = P(|x| > mult * RMS(x)), dimensionless
+    """saturation proxy = P(|x| > mult * RMS(x)), dimensionless."""
     xrms = torch.sqrt((x * x).mean(dim=-1, keepdim=True) + eps)
     thr = mult * xrms
     return float((x.abs() > thr).float().mean().item())
 
+
+def _as_int(x: Any, default: int = -1) -> int:
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+
+def _as_float(x: Any, default: float = float("nan")) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+# -----------------------------------------------------------------------------
+# Dataclasses
+# -----------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class PairGraphStats:
@@ -92,13 +116,17 @@ class HealthStats:
     t_star: Optional[int]
 
 
+# -----------------------------------------------------------------------------
+# Collector
+# -----------------------------------------------------------------------------
+
 class CTMStatsCollector:
     """Logs (1) init pairing diagnostics and (2) periodic sync health stats.
 
-    This is intentionally task-agnostic: it only needs tensors already produced by CTM.
+    Task-agnostic: consumes only tensors already produced by CTM.
     """
 
-    def __init__(self, log_fn=print):
+    def __init__(self, log_fn: Callable[[str], None] = print):
         self.log_fn = log_fn
 
     # -------------------- Init / graph diagnostics --------------------
@@ -106,24 +134,18 @@ class CTMStatsCollector:
     def pairing_graph_stats(self, role: str, left: Tensor, right: Tensor, n_self: int) -> PairGraphStats:
         left_cpu = left.detach().to("cpu", torch.int64).numpy()
         right_cpu = right.detach().to("cpu", torch.int64).numpy()
+
         J = int(left_cpu.shape[0])
-        n_self = int(min(n_self, J))
+        n_self = int(min(max(0, n_self), J))
 
+        # Unique directed pairs
         pairs = list(zip(left_cpu.tolist(), right_cpu.tolist()))
-        unique_pairs_frac = len(set(pairs)) / max(1, J)
+        unique_pairs_frac = float(len(set(pairs)) / max(1, J))
 
-        # Self fractions (make the contract visible)
-        if n_self > 0:
-            self_prefix_frac = float(np.mean(left_cpu[:n_self] == right_cpu[:n_self]))
-        else:
-            self_prefix_frac = 0.0
-
-        if J > n_self:
-            self_outside_prefix_frac = float(np.mean(left_cpu[n_self:] == right_cpu[n_self:]))
-        else:
-            self_outside_prefix_frac = 0.0
-
-        self_frac = float(np.mean(left_cpu == right_cpu))
+        # Self fractions (contract visibility)
+        self_prefix_frac = float(np.mean(left_cpu[:n_self] == right_cpu[:n_self])) if n_self > 0 else 0.0
+        self_outside_prefix_frac = float(np.mean(left_cpu[n_self:] == right_cpu[n_self:])) if J > n_self else 0.0
+        self_frac = float(np.mean(left_cpu == right_cpu)) if J > 0 else 0.0
 
         deg_min, deg_med, deg_max, unique_neurons = _degree_stats(left_cpu, right_cpu)
         top1 = _top_frac_incident(left_cpu, right_cpu, top_frac=0.01)
@@ -135,7 +157,7 @@ class CTMStatsCollector:
             self_prefix_frac=self_prefix_frac,
             self_outside_prefix_frac=self_outside_prefix_frac,
             self_frac=self_frac,
-            unique_pairs_frac=float(unique_pairs_frac),
+            unique_pairs_frac=unique_pairs_frac,
             unique_neurons=int(unique_neurons),
             deg_min=int(deg_min),
             deg_med=float(deg_med),
@@ -150,28 +172,43 @@ class CTMStatsCollector:
         role_graph: Dict[str, PairGraphStats],
         role_policy: Dict[str, Dict[str, Any]],
     ) -> None:
-        """
-        warmup_diag: output of initialize_ctm_pairs() top-level fields
-        role_graph: {"action": PairGraphStats, "out": PairGraphStats}
-        role_policy: {"action": diag["action"], "out": diag["out"]} (the rich init diag dicts)
-        """
+        """Log init summary with BOTH graph stats and init-policy diagnostics."""
         self.log_fn("=== CTM Pair Init Summary ===")
+
+        # Warmup summary (robust formatting)
+        wb = _as_int(warmup_diag.get("warmup_batches"), -1)
+        rc = _as_int(warmup_diag.get("reservoir_capacity"), -1)
+        ra_sz = _as_int(warmup_diag.get("reservoir_size_action"), -1)
+        ra_seen = _as_int(warmup_diag.get("reservoir_seen_action"), -1)
+        ro_sz = _as_int(warmup_diag.get("reservoir_size_out"), -1)
+        ro_seen = _as_int(warmup_diag.get("reservoir_seen_out"), -1)
+        tmu = _as_float(warmup_diag.get("t_star_mean"), float("nan"))
+        tsd = _as_float(warmup_diag.get("t_star_std"), float("nan"))
+
         self.log_fn(
-            f"Warmup: batches={warmup_diag.get('warmup_batches')} "
-            f"res_cap={warmup_diag.get('reservoir_capacity')} "
-            f"res_action={warmup_diag.get('reservoir_size_action')}/{warmup_diag.get('reservoir_seen_action')} "
-            f"res_out={warmup_diag.get('reservoir_size_out')}/{warmup_diag.get('reservoir_seen_out')} "
-            f"t_star_mean={warmup_diag.get('t_star_mean'):.2f} "
-            f"t_star_std={warmup_diag.get('t_star_std'):.2f}"
+            f"Warmup: batches={wb} res_cap={rc} "
+            f"res_action={ra_sz}/{ra_seen} res_out={ro_sz}/{ro_seen} "
+            f"t_star_mean={tmu:.2f} t_star_std={tsd:.2f}"
         )
 
-        for role in ["action", "out"]:
+        for role in ("action", "out"):
             st = role_graph[role]
-            pol = role_policy[role]
+            pol = role_policy.get(role, {})
 
-            # Low-rank + policy diagnostics (the ones you said were “missing”)
-            k_eff = pol.get("k_eff", warmup_diag.get(role, {}).get("k_eff", -1))
-            eta = pol.get("eta", warmup_diag.get(role, {}).get("eta", float("nan")))
+            # Low-rank + policy diagnostics
+            # (your initializer already returns these inside diag[role])
+            mode = str(pol.get("mode", ""))
+            k_eff = _as_int(pol.get("k_eff", warmup_diag.get(role, {}).get("k_eff", -1)), -1)
+            eta = _as_float(pol.get("eta", warmup_diag.get(role, {}).get("eta", float("nan"))), float("nan"))
+
+            M = _as_int(pol.get("M", -1), -1)
+            n_eff = _as_float(pol.get("n_eff", float("nan")), float("nan"))
+            f = _as_float(pol.get("f_bottleneck", float("nan")), float("nan"))
+            J_core = _as_int(pol.get("J_core", -1), -1)
+            J_wide = _as_int(pol.get("J_wide", -1), -1)
+            Bn = _as_int(pol.get("Bn", -1), -1)
+            dmax_core = _as_int(pol.get("dmax_core", -1), -1)
+            dmax_wide = _as_int(pol.get("dmax_wide", -1), -1)
 
             self.log_fn(
                 f"[{role}] "
@@ -181,16 +218,15 @@ class CTMStatsCollector:
                 f"unique_neurons={st.unique_neurons} "
                 f"deg(min/med/max)={st.deg_min}/{st.deg_med:.1f}/{st.deg_max} "
                 f"top1%_incident={st.top1pct_incident:.3f} "
-                f"k_eff={int(k_eff)} eta={float(eta):.3f} "
-                f"M={int(pol.get('M', -1))} n_eff={float(pol.get('n_eff', float('nan'))):.1f} "
-                f"f={float(pol.get('f_bottleneck', float('nan'))):.3f} "
-                f"J_core={int(pol.get('J_core', -1))} J_wide={int(pol.get('J_wide', -1))} "
-                f"Bn={int(pol.get('Bn', -1))} dmax_core={int(pol.get('dmax_core', -1))} dmax_wide={int(pol.get('dmax_wide', -1))} "
+                f"mode={mode} k_eff={k_eff} eta={eta:.3f} "
+                f"M={M} n_eff={n_eff:.1f} f={f:.3f} "
+                f"J_core={J_core} J_wide={J_wide} "
+                f"Bn={Bn} dmax_core={dmax_core} dmax_wide={dmax_wide} "
                 f"fp={st.fingerprint}"
             )
 
     def export_gephi_csv(self, path: str, role: str, left: Tensor, right: Tensor) -> None:
-        # Minimal Gephi edge list.
+        """Minimal Gephi edge list export."""
         l = left.detach().to("cpu", torch.int64).numpy()
         r = right.detach().to("cpu", torch.int64).numpy()
         with open(path, "w", encoding="utf-8") as f:
@@ -208,7 +244,10 @@ class CTMStatsCollector:
         t_star: Optional[int] = None,
         eps: float = 1e-12,
     ) -> HealthStats:
-        # z: (B,D), s_action/s_out: (B,J_role)
+        """Compute scale-free sync health metrics.
+
+        z: (B,D), s_action/s_out: (B,J_role)
+        """
         z_rms = float(torch.sqrt((z * z).mean() + eps).item())
 
         def ratio(sync: Tensor) -> float:
@@ -216,16 +255,16 @@ class CTMStatsCollector:
             den = torch.sqrt((z * z).sum(dim=-1) + eps)
             return float((num / den).mean().item())
 
-        # cosine between the two sync spaces (aggregate per batch)
-        # project to a scalar via mean pairwise cosine along batch:
         a = s_action
         o = s_out
-        # Align dims by reducing to per-sample norms/cos with dot after padding to min dim
         m = min(a.shape[-1], o.shape[-1])
-        adot = (a[..., :m] * o[..., :m]).sum(dim=-1)
-        an = torch.sqrt((a[..., :m] * a[..., :m]).sum(dim=-1) + eps)
-        on = torch.sqrt((o[..., :m] * o[..., :m]).sum(dim=-1) + eps)
-        cos = float((adot / (an * on)).mean().item())
+        if m <= 0:
+            cos = float("nan")
+        else:
+            adot = (a[..., :m] * o[..., :m]).sum(dim=-1)
+            an = torch.sqrt((a[..., :m] * a[..., :m]).sum(dim=-1) + eps)
+            on = torch.sqrt((o[..., :m] * o[..., :m]).sum(dim=-1) + eps)
+            cos = float((adot / (an * on)).mean().item())
 
         return HealthStats(
             z_rms=z_rms,
@@ -251,9 +290,11 @@ class CTMStatsCollector:
 
 
 class SyncTickCollector:
+    """Collect per-tick sync vectors via CTM forward(sync_callback=...)."""
+
     def __init__(self):
-        self.action = {}
-        self.out = {}
+        self.action: Dict[int, Tensor] = {}
+        self.out: Dict[int, Tensor] = {}
 
     def reset(self):
         self.action.clear()
@@ -261,15 +302,16 @@ class SyncTickCollector:
 
     def __call__(self, tick_idx: int, role: str, sync_vec: torch.Tensor):
         if role == "action":
-            self.action[tick_idx] = sync_vec.detach()
+            self.action[int(tick_idx)] = sync_vec.detach()
         else:
-            self.out[tick_idx] = sync_vec.detach()
+            self.out[int(tick_idx)] = sync_vec.detach()
 
-    def get(self, role: str, tick_idx: int):
+    def get(self, role: str, tick_idx: Optional[int]):
         d = self.action if role == "action" else self.out
+        if tick_idx is None:
+            return None
         if tick_idx in d:
             return d[tick_idx]
-        # fallback to last available
         if len(d) == 0:
             return None
         return d[max(d.keys())]
