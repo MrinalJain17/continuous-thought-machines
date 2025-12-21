@@ -490,7 +490,16 @@ if __name__=='__main__':
                 sync_health.reset()
 
                 # Separate diagnostic forward for stable health metrics (dropout-free, BN-safe)
-                with preserve_rng_state(True), torch.inference_mode(), batchnorm_use_batch_stats_no_update(model):
+                with (
+                    preserve_rng_state(True),
+                    torch.inference_mode(),
+                    batchnorm_use_batch_stats_no_update(model),
+                    torch.autocast(
+                        device_type="cuda" if "cuda" in device else "cpu",
+                        dtype=torch.float16,
+                        enabled=args.use_amp
+                    )
+                ):
                     _pred_raw_h, cert_h, _sync_h = model(
                         inputs,
                         track=False,
