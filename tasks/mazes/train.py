@@ -381,7 +381,7 @@ if __name__=='__main__':
             ctm_stats.log_init(
                 init_diag,
                 role_stats,
-                role_diag={
+                role_policy={
                     "action": init_diag.get("action", {}),
                     "out": init_diag.get("out", {}),
                 }
