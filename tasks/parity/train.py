@@ -26,6 +26,17 @@ from tasks.parity.utils import prepare_model, reshape_attention_weights, reshape
 from utils.housekeeping import set_seed, zip_python_code
 from utils.losses import parity_loss
 from utils.schedulers import WarmupCosineAnnealingLR, WarmupMultiStepLR, warmup
+import contextlib
+from models.ctm_synch_init import (
+    initialize_headrk_pairs,
+    log_headrk_initialization,
+    neutral_action_pairs_for_warmup,
+    bn_batch_stats_no_update,
+    ctm_trace_fn,
+    RoleBudgets,
+    WarmupConfig,
+)
+
 
 torchvision.disable_beta_transforms_warning()
 torch.serialization.add_safe_globals([argparse.Namespace])
@@ -199,7 +210,58 @@ if __name__=='__main__':
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    
+    else:
+        # ---------------------------------------------------------------------
+        # One-shot HEADR-K initialization (fresh runs only; do not overwrite checkpoints)
+        # ---------------------------------------------------------------------
+        assert model.neuron_select_type == "random-pairing", (
+            "HEADR-K requires neuron_select_type='random-pairing' because it sets explicit pair buffers."
+        )
+
+        # n_self must be <= each role budget under random-pairing
+        n_self = min(int(args.n_random_pairing_self), int(model.n_synch_action), int(model.n_synch_out))
+
+        budgets = RoleBudgets(
+            J_out=int(model.n_synch_out),
+            J_action=int(model.n_synch_action),
+            n_self=int(n_self),
+        )
+
+        warmup_cfg = WarmupConfig(
+            seed=int(args.seed),
+            preserve_global_rng_state=True,
+            sampling="contiguous",        # parity is synthetic; contiguous is sufficient
+            warmup_batches=None,          # auto from target_observations
+            target_observations=100_000,  # good default; adapts to B*T
+            max_warmup_batches=256,
+        )
+
+        with bn_batch_stats_no_update(model), neutral_action_pairs_for_warmup(model, n_self=budgets.n_self, seed=args.seed):
+            pairs_by_role, U, init_diag = initialize_headrk_pairs(
+                model=model,
+                dataloader=trainloader,
+                trace_fn=ctm_trace_fn,
+                budgets=budgets,
+                warmup=warmup_cfg,
+                device=device,
+                d_model=model.d_model,
+                warmup_context=contextlib.nullcontext(),
+                disjoint_roles=False,
+            )
+
+        # Install final pairs once.
+        for role in ("action", "out"):
+            left = torch.tensor([i for (i, j) in pairs_by_role[role]], device=next(model.parameters()).device, dtype=torch.long)
+            right = torch.tensor([j for (i, j) in pairs_by_role[role]], device=next(model.parameters()).device, dtype=torch.long)
+            model.set_neuron_pairs(role, left, right)
+
+        # Log diagnostic report + plots to log_dir
+        log_headrk_initialization(
+            log_dir=args.log_dir,
+            U=U,
+            pairs_by_role=pairs_by_role,
+            diag=init_diag,
+        )
     
     # Training
     iterator = iter(trainloader)  # Not training in epochs, but rather iterations. Need to reset this from time to time
