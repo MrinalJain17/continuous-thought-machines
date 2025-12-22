@@ -543,7 +543,7 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
         buf_left.copy_(left)
         buf_right.copy_(right)
 
-    def forward(self, x, track=False):
+    def forward(self, x, track=False, callback=None):
         B = x.size(0)
         device = x.device
 
@@ -597,6 +597,8 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             # One would also keep an 'activated_state_trace' as the history of outgoing post-activations
             # BUT, this is unnecessary because the synchronisation calculation is fully linear and can be
             # done using only the currect activated state (see compute_synchronisation method for explanation)
+            if callback is not None:
+                callback(stepi, activated_state)
 
             # --- Calculate Synchronisation for Output Predictions ---
             synchronisation_out, decay_alpha_out, decay_beta_out = self.compute_synchronisation(activated_state, decay_alpha_out, decay_beta_out, r_out, synch_type='out')
