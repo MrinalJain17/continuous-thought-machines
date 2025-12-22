@@ -521,8 +521,27 @@ class ContinuousThoughtMachine(nn.Module, PyTorchModelHubMixin):
             raise ValueError(f"Invalid neuron selection type: {self.neuron_select_type}")
         return synch_representation_size
 
+    def set_neuron_pairs(self, synch_type: str, left: torch.Tensor, right: torch.Tensor) -> None:
+        """Overwrite neuron-pair index buffers in-place.
 
+        This is used for one-shot initialization of random-pairing indices during warmup.
+        Buffers are preserved in the state_dict.
+        """
+        assert synch_type in ('out', 'action'), f"Invalid synch_type: {synch_type}"
+        n_synch = self.n_synch_action if synch_type == "action" else self.n_synch_out
+        if n_synch == 0:
+            return
 
+        buf_left = getattr(self, f"{synch_type}_neuron_indices_left", None)
+        buf_right = getattr(self, f"{synch_type}_neuron_indices_right", None)
+        assert buf_left is not None and buf_right is not None, "Neuron index buffers not initialized."
+        assert left.shape == buf_left.shape and right.shape == buf_right.shape, (
+            f"Shape mismatch: expected {tuple(buf_left.shape)}"
+        )
+        left = left.to(device=buf_left.device, dtype=buf_left.dtype)
+        right = right.to(device=buf_right.device, dtype=buf_right.dtype)
+        buf_left.copy_(left)
+        buf_right.copy_(right)
 
     def forward(self, x, track=False):
         B = x.size(0)
