@@ -14,8 +14,8 @@ python -m tasks.parity.train \
     --n_test_batches 20 \
     --d_model 1024 \
     --d_input 512 \
-    --n_synch_out 32 \
-    --n_synch_action 32 \
+    --n_synch_out 528 \
+    --n_synch_action 528 \
     --synapse_depth 1 \
     --heads 8 \
     --memory_hidden_dims 16 \
