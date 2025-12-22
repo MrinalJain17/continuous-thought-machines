@@ -137,7 +137,7 @@ def ctm_trace_fn(model, x: torch.Tensor) -> torch.Tensor:
     states = []
     def cb(t: int, z: torch.Tensor):
         states.append(z)
-    model(x, track=False, callback=cb, sync_callback=None)
+    model(x, track=False, callback=cb)
     return torch.stack(states, dim=1)
 
 
