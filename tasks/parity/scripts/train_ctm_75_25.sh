@@ -43,4 +43,5 @@ python -m tasks.parity.train \
     --no-reload_model_only \
     --device 0 \
     --no-use_amp \
-    --neuron_select_type "random"
+    --neuron_select_type "random-pairing"
+    --n_random_pairing_self 32
